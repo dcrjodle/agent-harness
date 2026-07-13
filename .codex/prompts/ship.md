@@ -1,4 +1,4 @@
 ---
-description: Branch, commit, push, open PR (small model sub-agent)
+description: Commit, push, open PR (small model sub-agent)
 ---
-Fire a small-tier sub-agent per skills/git-ops.md to ship the current changes as a PR. $ARGUMENTS
+Fire a small-tier sub-agent per ~/.agent-harness/skills/git-ops.md (Ship) to ship the current worktree as a PR. $ARGUMENTS

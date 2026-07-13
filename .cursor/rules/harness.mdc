@@ -2,4 +2,4 @@
 description: Agent harness contract
 alwaysApply: true
 ---
-Read AGENTS.md and follow it exactly: rules/, sub-agent tiers, the loop, cache/.
+Read ~/.agent-harness/AGENTS.md and follow it exactly: rules/, sub-agent tiers, the loop, cache/.

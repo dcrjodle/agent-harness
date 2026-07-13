@@ -1,6 +1,6 @@
 # Machine rules
-Personal setup rules, gitignored. Copy to `MACHINE.md` — agents read it and it overrides repo docs.
+Examples for `MACHINE.md` (personal, gitignored — created empty by setup.sh). Agents read it and it overrides repo docs. Copy lines from here as needed:
 
-- e.g. Use pnpm, not npm.
-- e.g. Assign PRs to `<gh-user>`.
-- e.g. Local DB runs on port 5433.
+- Use pnpm, not npm.
+- Assign PRs to `<gh-user>`.
+- Local DB runs on port 5433.

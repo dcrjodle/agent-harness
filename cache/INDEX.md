@@ -1,2 +1,2 @@
 # Recipes
-<!-- - [build-and-test](recipes/build-and-test.md) — verify any change -->
+<!-- - [my-app/build-and-test](recipes/my-app/build-and-test.md) — verify any change -->
