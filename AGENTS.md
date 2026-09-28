@@ -10,7 +10,7 @@ Global contract for coding agents on this machine (Claude Code, Codex, Cursor), 
 Read the rules file for each stack before editing it: `~/.agent-harness/rules/git.md` (every task), `~/.agent-harness/rules/react.md`, `~/.agent-harness/rules/typescript.md`, `~/.agent-harness/rules/dotnet.md`, `~/.agent-harness/rules/python.md`.
 
 ## Work
-Solve every code change with `/loop [min|med|max] <task>` (`~/.agent-harness/skills/loop/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
+Solve every code change with `/solve [min|med|max] <task>` (`~/.agent-harness/skills/solve/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
 
 | Role | Tier | Job |
 |---|---|---|

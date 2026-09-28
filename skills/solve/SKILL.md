@@ -1,5 +1,5 @@
 ---
-name: loop
+name: solve
 description: Solve a coding task end to end with the harness loop — task worktree, plan, parallel implementation, tests, review, PR. Use for any change request in a git repo.
 argument-hint: "[min|med|max] <task or issue numbers>"
 ---

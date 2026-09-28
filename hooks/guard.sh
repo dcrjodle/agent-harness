@@ -38,11 +38,12 @@ cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty | if type == "
 
 # .env reads via shell readers/searchers: match the path token independently of
 # what precedes it (flags, other args), excluding .env.example/.sample/.template.
-if printf '%s' "$cmd" | grep -Eq '(^|[;&|[:space:]])(cat|less|more|head|tail|bat|strings|base64|xxd|od|grep|egrep|fgrep|sed|awk|jq)([[:space:]]|$)' \
-   && printf '%s' "$cmd" | grep -Eq '(^|[/"'\''[:space:]=])\.env(\.[a-zA-Z_]+)?(["'\'';&|[:space:]]|$)' \
-   && ! printf '%s' "$cmd" | grep -Eq '\.env\.(example|sample|template)(["'\'';&|[:space:]]|$)'; then
+while IFS= read -r seg; do
+  printf '%s' "$seg" | grep -Eq '(^|[[:space:]])(cat|less|more|head|tail|bat|strings|base64|xxd|od|grep|egrep|fgrep|sed|awk|jq)([[:space:]]|$)' || continue
+  printf '%s' "$seg" | grep -Eq '(^|[/"'\''[:space:]=])\.env(\.[a-zA-Z_]+)?(["'\''[:space:]]|$)' || continue
+  printf '%s' "$seg" | grep -Eq '\.env\.(example|sample|template)(["'\''[:space:]]|$)' && continue
   deny "don't read .env files; pass secrets by reference (source / --env-file)."
-fi
+done <<< "$(printf '%s\n' "$cmd" | tr ';&|' '\n\n\n')"
 
 # Global git options before the subcommand, e.g. `--no-pager`, `-c k=v`, `-C <path>`.
 git_opts='(-C[[:space:]]+[^[:space:]]+|-c[[:space:]]+[^[:space:]]+|--no-pager|--paginate|--git-dir=[^[:space:]]+|--work-tree=[^[:space:]]+|--)'
@@ -51,9 +52,20 @@ printf '%s' "$cmd" | grep -Eq "$git_re" || exit 0
 
 # Extract the -C path (if any) that applies to the matched git invocation, to run
 # the branch check against the right worktree instead of skipping it outright.
+resolve_path() {
+  local p="${1#[\"\']}"; p="${p%[\"\']}"
+  case "$p" in
+    "~"*) p="$HOME${p#\~}" ;;
+    /*) ;;
+    *) p="$2/$p" ;;
+  esac
+  printf '%s' "$p"
+}
 git_cwd="$cwd"
+cd_path="$(printf '%s' "$cmd" | grep -Eo '(^|[;&|[:space:]])cd[[:space:]]+[^;&|[:space:]]+' | tail -1 | sed -E 's/^.*cd[[:space:]]+//')"
+[ -n "$cd_path" ] && git_cwd="$(resolve_path "$cd_path" "$cwd")"
 c_path="$(printf '%s' "$cmd" | grep -Eo '(^|[;&|[:space:]])git([[:space:]]+'"$git_opts"')*[[:space:]]+(push|commit)' | grep -Eo -- '-C[[:space:]]+[^[:space:]]+' | tail -1 | sed -E 's/^-C[[:space:]]+//')"
-[ -n "$c_path" ] && git_cwd="$c_path"
+[ -n "$c_path" ] && git_cwd="$(resolve_path "$c_path" "$git_cwd")"
 
 if printf '%s' "$cmd" | grep -Eq "(^|[;&|[:space:]])git([[:space:]]+${git_opts})*[[:space:]]+push"; then
   # Isolate the push segment (up to the next command separator) so unrelated
@@ -71,6 +83,8 @@ fi
 # task-start" nudge for commit; it must never waive the push-to-default deny above.
 case "$cmd" in *HARNESS_ALLOW_DEFAULT=1*) exit 0 ;; esac
 
+case "$git_cwd" in *'$'*) exit 0 ;; esac
+[ -d "$git_cwd" ] || exit 0
 branch="$(git -C "$git_cwd" branch --show-current 2>/dev/null)" || exit 0
 default="$(harness_default_branch "$git_cwd" 2>/dev/null || echo main)"
 case "$branch" in
