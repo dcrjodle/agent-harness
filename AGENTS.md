@@ -15,12 +15,13 @@ Solve every code change with `/solve [min|med|max] <task>` (`~/.agent-harness/sk
 | Role | Tier | Job |
 |---|---|---|
 | planner | large | decisions, parallel lanes, acceptance checks |
-| implementer | medium | code + unit tests, commit per issue, fixes |
-| tester | medium | gates + acceptance checks with evidence |
+| implementer | large (medium for mechanical lanes) | product code, static checks, commit per issue, fixes; never tests |
+| tester | medium | writes and runs all automated tests |
+| verifier | medium | runs the app, verify checks, screenshots |
 | reviewer | large, re-review medium | findings file |
 | searcher | small | lookups |
 
-Tiers — Claude Code: haiku / sonnet / opus. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
+Tiers — Claude Code: haiku / sonnet / opus. Large does the thinking (plan, code, first review), medium the procedural work (tests, app runs, re-reviews), small the lookups. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
 
 Git plumbing is scripted, no agent needed: `~/.agent-harness/bin/task-start`, `~/.agent-harness/bin/task-ship`, `~/.agent-harness/bin/task-cleanup`.
 

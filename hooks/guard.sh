@@ -12,6 +12,29 @@ case "$tool" in
 esac
 
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+role="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
+
+if [ "$role" = "implementer" ]; then
+  handoff="tests and screenshots belong to the tester and verifier. Commit your code, run only static checks (compile, typecheck, lint), and list what needs testing in your report."
+  case "$tool" in
+    mcp__*)
+      printf '%s' "$tool" | grep -Eqi 'browser|chrome|simulator|ios|android|blender|godot|playwright|puppeteer|screenshot|preview|computer' \
+        && deny "implementers don't run apps, browsers, simulators or 3D tools; $handoff"
+      ;;
+    Edit|Write)
+      path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty')"
+      printf '%s' "$path" | grep -Eqi '(^|/)(tests?|__tests__|spec|specs|e2e|cypress|playwright)(/|$)|[._-](test|spec)\.[a-z0-9]+$|(^|/)test_[^/]+$' \
+        && deny "implementers don't write tests; $handoff"
+      ;;
+    Bash)
+      c="$(printf '%s' "$input" | jq -r '.tool_input.command // empty | if type == "array" then join(" ") else . end')"
+      printf '%s' "$c" | grep -Eqi '(^|[;&|[:space:]])((npm|pnpm|yarn|bun)([[:space:]]+run)?[[:space:]]+[a-z0-9:_-]*(test|e2e|spec|checks|scenario|screenshot|storybook)[a-z0-9:_-]*|(npx|pnpm[[:space:]]+exec|bunx)?[[:space:]]*(vitest|jest|mocha|playwright|cypress|pytest|detox|maestro)([[:space:]]|$)|dotnet[[:space:]]+test|cargo[[:space:]]+(test|nextest)|go[[:space:]]+test|xcodebuild[^;&|]*[[:space:]]test|gradlew?[[:space:]]+[a-z]*test|mvn[[:space:]]+test|[^[:space:]]*(test|tests|scenario|e2e|screenshot|capture)[a-z0-9_-]*\.(sh|mjs|cjs|js|ts|py))' \
+        && deny "implementers don't run tests, scenarios or screenshot scripts; $handoff"
+      printf '%s' "$c" | grep -Eqi '(^|[;&|[:space:]])((npm|pnpm|yarn|bun)([[:space:]]+run)?[[:space:]]+(dev|start|preview|serve|ios|android|web)([[:space:]]|$)|(npx[[:space:]]+)?expo[[:space:]]+(start|run)|electron([[:space:]]|-vite[[:space:]]+(dev|preview))|screencapture|xcrun[[:space:]]+simctl|open[[:space:]]+-a[[:space:]]+(simulator|blender|godot)|[^[:space:]]*(godot|blender)[^[:space:]]*[[:space:]].*(--run|--scene|-s[[:space:]]))' \
+        && deny "implementers don't start apps, dev servers or simulators; $handoff"
+      ;;
+  esac
+fi
 
 # env-file basename check, shared by the Read/Grep path and the Bash path.
 is_env_path() {
