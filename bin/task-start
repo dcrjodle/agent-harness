@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(dirname "$0")/_lib.sh"
-usage="usage: task-start <feat|fix|chore> <slug> [repo-path]"
+usage="usage: task-start <feat|fix|chore|refactor|docs|test> <slug> [repo-path]"
 type="${1:?$usage}"; slug="${2:?$usage}"; repo="${3:-$PWD}"
 case "$type" in feat|fix|chore|refactor|docs|test) ;; *) echo "$usage" >&2; exit 1 ;; esac
 
@@ -17,7 +17,8 @@ fi
 
 dir="$HOME/.agent-worktrees/$name"
 final="$slug"; n=2
-while [ -e "$dir/$final" ] || git -C "$root" show-ref --verify --quiet "refs/heads/$type/$final"; do
+while [ -e "$dir/$final" ] || git -C "$root" show-ref --verify --quiet "refs/heads/$type/$final" \
+    || { git -C "$root" remote get-url origin >/dev/null 2>&1 && git -C "$root" ls-remote --exit-code --heads origin "$type/$final" >/dev/null 2>&1; }; do
   final="$slug-$n"; n=$((n + 1))
 done
 mkdir -p "$dir"

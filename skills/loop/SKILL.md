@@ -3,7 +3,7 @@ name: loop
 description: Solve a coding task end to end with the harness loop — task worktree, plan, parallel implementation, tests, review, PR. Use for any change request in a git repo.
 argument-hint: "[min|med|max] <task or issue numbers>"
 ---
-Task: $ARGUMENTS
+Task: the user's request ($ARGUMENTS)
 
 You are the orchestrator, usually on the most expensive model. You never read or edit source files. You run scripts, brief roles, and pass file paths. Details live in handoff files, not in your context.
 
@@ -15,7 +15,7 @@ First word `min|med|max` wins. Otherwise choose:
 
 ## 2. Start
 - File issues first if the user asked for them (one `gh issue create` each).
-- `~/.agent-harness/bin/task-start <feat|fix|chore> <slug>` prints `worktree=`, `branch=` and `handoff=`. All stages work in the worktree; all stage files go in the handoff dir (outside the repo).
+- `~/.agent-harness/bin/task-start <feat|fix|chore|refactor|docs|test> <slug>` prints `worktree=`, `branch=` and `handoff=`. All stages work in the worktree; all stage files go in the handoff dir (outside the repo).
 - Recipes for this repo were listed at session start. Name the matching recipe paths in every brief.
 
 ## 3. Stages
@@ -30,6 +30,7 @@ One sub-agent per stage, background, with the role file from `~/.agent-harness/a
 | fix | implementer (medium) | `→ fixed/skipped` under each finding |
 | re-review | reviewer (medium), round 2 scope | `handoff/review-N.md` |
 
+- Role files pin a default tier (e.g. reviewer pins large/opus). For re-review, override it down to medium/sonnet explicitly when launching that stage — the role file's pin is only the default, not a floor.
 - Lanes run in parallel only when the plan says their files are disjoint; lane 0 finishes first.
 - Failed tester checks and review findings both go to the fix stage. After a fix, re-run test (if it failed) and re-review.
 - At most 2 fix rounds. Then ship; whatever is still open goes into the PR body under "Open items" and into your final message.

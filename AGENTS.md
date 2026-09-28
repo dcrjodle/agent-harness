@@ -7,10 +7,10 @@ Global contract for coding agents on this machine (Claude Code, Codex, Cursor), 
 - Personal rules: `~/.agent-harness/MACHINE.md` (gitignored) overrides this file.
 
 ## Rules
-Read the rules file for each stack before editing it: `rules/git.md` (every task), `rules/react.md`, `rules/typescript.md`, `rules/dotnet.md`, `rules/python.md`.
+Read the rules file for each stack before editing it: `~/.agent-harness/rules/git.md` (every task), `~/.agent-harness/rules/react.md`, `~/.agent-harness/rules/typescript.md`, `~/.agent-harness/rules/dotnet.md`, `~/.agent-harness/rules/python.md`.
 
 ## Work
-Solve every code change with `/loop [min|med|max] <task>` (`skills/loop/SKILL.md`). Roles are in `agents/`:
+Solve every code change with `/loop [min|med|max] <task>` (`~/.agent-harness/skills/loop/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
 
 | Role | Tier | Job |
 |---|---|---|
@@ -22,10 +22,10 @@ Solve every code change with `/loop [min|med|max] <task>` (`skills/loop/SKILL.md
 
 Tiers — Claude Code: haiku / sonnet / opus. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
 
-Git plumbing is scripted, no agent needed: `bin/task-start`, `bin/task-ship`, `bin/task-cleanup`.
+Git plumbing is scripted, no agent needed: `~/.agent-harness/bin/task-start`, `~/.agent-harness/bin/task-ship`, `~/.agent-harness/bin/task-cleanup`.
 
 ## Cost
 The main session runs the most expensive model, so it only orchestrates: no code exploration, no reading source, no copying findings into briefs. Discovery belongs to the planner or searcher; details go through handoff files.
 
 ## Cache
-Private recipes in `cache/recipes/<repo>/` are listed at session start by a hook (Cursor: `ls` that folder). A match → follow it verbatim, still verify. Discovery-heavy task → `/recipe`.
+Private recipes in `~/.agent-harness/cache/recipes/<repo>/` are listed at session start by a hook (Cursor: `ls` that folder). A match → follow it verbatim, still verify. Discovery-heavy task → `/recipe`.

@@ -33,14 +33,14 @@ merge_hooks() {
      --arg guard 'f="$HOME/.agent-harness/hooks/guard.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg log 'f="$HOME/.agent-harness/hooks/stage-log.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg matcher "$guard_matcher" --argjson subagents "$3" '
-    def strip: map(.hooks |= map(select((.command // "") | contains(".agent-harness/hooks/") | not))) | map(select(.hooks | length > 0));
+    def strip: map(.hooks = ((.hooks // []) | map(select((.command // "") | contains(".agent-harness/hooks/") | not)))) | map(select(.hooks | length > 0));
     def add(ev; entry): .hooks[ev] = (((.hooks[ev] // []) | strip) + [entry]);
     .hooks = (.hooks // {})
     | add("SessionStart"; {hooks: [{type: "command", command: $ctx}]})
     | add("PreToolUse"; (if $matcher == "" then {} else {matcher: $matcher} end) + {hooks: [{type: "command", command: $guard}]})
     | if $subagents then add("SubagentStart"; {hooks: [{type: "command", command: $log}]}) | add("SubagentStop"; {hooks: [{type: "command", command: $log}]}) else . end
-  ' "$file" > "$tmp" && cat "$tmp" > "$file" && rm "$tmp"
-  echo "hooks merged into $file (backup: $file.pre-harness)"
+  ' "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp" && echo "hooks merged into $file (backup: $file.pre-harness)" \
+    || { echo "hook merge failed for $file" >&2; rm -f "$tmp"; return 1; }
 }
 
 if [ "${1:-}" = "--project" ]; then
@@ -72,7 +72,7 @@ for d in "${SKILLS[@]}"; do n="$(basename "$d")"; link "$HARNESS/skills/$n" "$HO
 prune "$HOME/.claude/agents"; prune "$HOME/.claude/skills"; prune "$HOME/.claude/commands"
 touch "$HOME/.claude/CLAUDE.md"
 grep -qF '@~/.agent-harness/AGENTS.md' "$HOME/.claude/CLAUDE.md" || printf '\n@~/.agent-harness/AGENTS.md\n' >> "$HOME/.claude/CLAUDE.md"
-merge_hooks "$HOME/.claude/settings.json" "Bash|Agent|Task" true
+merge_hooks "$HOME/.claude/settings.json" "Bash|Agent|Task|Read|Grep" true
 
 # Codex — skills, hooks, AGENTS.md pointer
 mkdir -p "$HOME/.codex/skills" "$HOME/.codex/prompts"

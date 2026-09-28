@@ -3,5 +3,4 @@ MACHINE.md
 .claude/settings.local.json
 .DS_Store
 cache/recipes/
-cache/INDEX.md
 logs/

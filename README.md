@@ -23,6 +23,7 @@ The clone is symlinked to `~/.agent-harness`. Each CLI's user config then points
 - `/loop [min|med|max] <task>` solves a change end to end. min: implement → PR. med: implement → test → review → PR. max: plan → parallel implement lanes → test → review → PR. Without a degree the orchestrator picks one from the task size.
 - `/plan` `/test` `/review` `/ship` `/search` run one stage. `/recipe` saves what a session learned. `/cleanup` removes merged worktrees.
 - `bin/stage-times` shows how long each sub-agent stage took.
+- Invocation differs by CLI: Claude Code uses `/loop ...` (slash command). Codex invokes the same file as a prompt, e.g. `$loop ...` (no `/`, and `$ARGUMENTS` is not expanded — the skill text stands on its own without it). Cursor runs it as a linked command from `.cursor/commands/` after `./setup.sh --project <path>`.
 
 ## Layout
 | Path | What |
@@ -32,7 +33,8 @@ The clone is symlinked to `~/.agent-harness`. Each CLI's user config then points
 | `agents/` | roles: planner, implementer, tester, reviewer, searcher (Claude subagents; other CLIs run them inline) |
 | `skills/` | entry points: loop, plan, test, review, ship, search, recipe, cleanup |
 | `bin/` | `task-start`, `task-ship`, `task-cleanup`, `stage-times` |
-| `hooks/` | `session-context.sh` lists this repo's recipes at session start; `guard.sh` blocks force-pushes, pushes and commits on the default branch, `.env` reads, and sub-agents spawning sub-agents; `stage-log.sh` records stage timings |
+| `hooks/` | `session-context.sh` lists this repo's recipes at session start; `guard.sh` blocks force-pushes, pushes and commits on the default branch, `.env` reads (Bash and Claude's Read/Grep tools), and sub-agents spawning sub-agents; `stage-log.sh` records stage timings |
+| `cursor/` | `harness.mdc` — the Cursor User Rule content, linked in per repo by `--project` |
 | `cache/recipes/` | private per-repo recipes (gitignored) |
 | `MACHINE.md`, `.env` | personal rules and keys (gitignored) |
 
