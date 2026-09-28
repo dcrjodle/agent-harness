@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_lib.sh"
+root="$(harness_repo_root "${1:-$PWD}")" || { echo "not a git repo" >&2; exit 1; }
+name="$(basename "$root")"
+cd "$root"
+git worktree list --porcelain | awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p" "$2}' |
+while read -r path branch; do
+  case "$path" in "$HOME/.agent-worktrees/$name/"*) ;; *) continue ;; esac
+  state="$(gh pr view "$branch" --json state -q .state 2>/dev/null || echo NONE)"
+  if [ "$state" = "MERGED" ]; then
+    git worktree remove --force "$path" && git branch -D "$branch" >/dev/null && rm -rf "$path.handoff"
+    echo "removed $path ($branch)"
+  else
+    echo "kept $path ($branch, PR $state)"
+  fi
+done
+git worktree prune

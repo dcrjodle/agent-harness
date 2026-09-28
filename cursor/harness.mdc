@@ -1,0 +1,5 @@
+---
+description: Agent harness contract
+alwaysApply: true
+---
+Read ~/.agent-harness/AGENTS.md and follow it exactly: rules/, agents/ (run roles inline), skills/loop, cache/recipes/.

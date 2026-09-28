@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_lib.sh"
+usage="usage: task-start <feat|fix|chore> <slug> [repo-path]"
+type="${1:?$usage}"; slug="${2:?$usage}"; repo="${3:-$PWD}"
+case "$type" in feat|fix|chore|refactor|docs|test) ;; *) echo "$usage" >&2; exit 1 ;; esac
+
+root="$(harness_repo_root "$repo")" || { echo "not a git repo: $repo" >&2; exit 1; }
+name="$(basename "$root")"
+default="$(harness_default_branch "$root")"
+if git -C "$root" remote get-url origin >/dev/null 2>&1; then
+  git -C "$root" fetch -q origin "$default"
+  base="origin/$default"
+else
+  base="$default"
+fi
+
+dir="$HOME/.agent-worktrees/$name"
+final="$slug"; n=2
+while [ -e "$dir/$final" ] || git -C "$root" show-ref --verify --quiet "refs/heads/$type/$final"; do
+  final="$slug-$n"; n=$((n + 1))
+done
+mkdir -p "$dir"
+git -C "$root" worktree add -q "$dir/$final" -b "$type/$final" "$base"
+mkdir -p "$dir/$final.handoff"
+
+echo "worktree=$dir/$final"
+echo "branch=$type/$final"
+echo "base=$base $(git -C "$root" rev-parse --short "$base")"
+echo "handoff=$dir/$final.handoff"

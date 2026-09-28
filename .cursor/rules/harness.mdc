@@ -1,5 +1,0 @@
----
-description: Agent harness contract
-alwaysApply: true
----
-Read ~/.agent-harness/AGENTS.md and follow it exactly: rules/, sub-agent tiers, the loop, cache/.
