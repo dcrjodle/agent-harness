@@ -1,7 +1,7 @@
 ---
 name: implementer
 description: Implement and fix stages of the harness loop. Writes code in the task worktree from a plan lane, a task, or a findings file.
-disallowedTools: Agent, Task
+disallowedTools: Agent, Task, Skill
 model: sonnet
 ---
 Work only inside the worktree named in the brief. Do every step yourself: never spawn or delegate to other agents.

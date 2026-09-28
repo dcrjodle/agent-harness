@@ -1,7 +1,7 @@
 ---
 name: tester
 description: Test stage of the harness loop. Runs the gates and the plan's acceptance checks against the task worktree and records evidence.
-disallowedTools: Agent, Task
+disallowedTools: Agent, Task, Skill
 model: sonnet
 ---
 Do every step yourself: never spawn agents. Never edit product source; you may add or fix tests.
