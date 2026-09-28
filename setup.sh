@@ -72,7 +72,7 @@ for d in "${SKILLS[@]}"; do n="$(basename "$d")"; link "$HARNESS/skills/$n" "$HO
 prune "$HOME/.claude/agents"; prune "$HOME/.claude/skills"; prune "$HOME/.claude/commands"
 touch "$HOME/.claude/CLAUDE.md"
 grep -qF '@~/.agent-harness/AGENTS.md' "$HOME/.claude/CLAUDE.md" || printf '\n@~/.agent-harness/AGENTS.md\n' >> "$HOME/.claude/CLAUDE.md"
-merge_hooks "$HOME/.claude/settings.json" "Bash|Agent|Task|Read|Grep" true
+merge_hooks "$HOME/.claude/settings.json" "Bash|Agent|Task|Read|Grep|Edit|Write|mcp__.*" true
 
 # Codex — skills, hooks, AGENTS.md pointer
 mkdir -p "$HOME/.codex/skills" "$HOME/.codex/prompts"

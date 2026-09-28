@@ -10,17 +10,18 @@ Global contract for coding agents on this machine (Claude Code, Codex, Cursor), 
 Read the rules file for each stack before editing it: `~/.agent-harness/rules/git.md` (every task), `~/.agent-harness/rules/react.md`, `~/.agent-harness/rules/typescript.md`, `~/.agent-harness/rules/dotnet.md`, `~/.agent-harness/rules/python.md`.
 
 ## Work
-Solve every code change with `/loop [min|med|max] <task>` (`~/.agent-harness/skills/loop/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
+Solve every code change with `/solve [min|med|max] <task>` (`~/.agent-harness/skills/solve/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
 
 | Role | Tier | Job |
 |---|---|---|
 | planner | large | decisions, parallel lanes, acceptance checks |
-| implementer | medium | code + unit tests, commit per issue, fixes |
-| tester | medium | gates + acceptance checks with evidence |
+| implementer | large (medium for mechanical lanes) | product code, static checks, commit per issue, fixes; never tests |
+| tester | medium | writes and runs all automated tests |
+| verifier | medium | runs the app, verify checks, screenshots |
 | reviewer | large, re-review medium | findings file |
 | searcher | small | lookups |
 
-Tiers — Claude Code: haiku / sonnet / opus. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
+Tiers — Claude Code: haiku / sonnet / opus. Large does the thinking (plan, code, first review), medium the procedural work (tests, app runs, re-reviews), small the lookups. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
 
 Git plumbing is scripted, no agent needed: `~/.agent-harness/bin/task-start`, `~/.agent-harness/bin/task-ship`, `~/.agent-harness/bin/task-cleanup`.
 
