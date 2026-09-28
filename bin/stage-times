@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+log="$HOME/.agent-harness/logs/stages.tsv"
+[ -f "$log" ] || { echo "no stage log yet ($log)"; exit 0; }
+jq -Rrn '
+  [[inputs | split("\t") | {t: (.[0] | fromdate), ev: .[1], type: .[2], id: .[3]}]
+  | group_by(.id)[]
+  | (map(select(.ev == "SubagentStart"))[0]) as $s
+  | (map(select(.ev == "SubagentStop"))[-1]) as $e
+  | select($s != null and $e != null)
+  | {t: $s.t, row: [($s.t | todate), $s.type, ((($e.t - $s.t) / 60 * 10 | round) / 10 | tostring) + " min"]}]
+  | sort_by(.t)[] | .row | @tsv' "$log" | tail -"${1:-20}"

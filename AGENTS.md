@@ -1,39 +1,31 @@
 # Agent Harness
 
-Global contract for coding agents (Claude Code, Cursor, Codex) on this machine, installed at `~/.agent-harness`. Follow exactly.
-This file is the only always-loaded context. Everything it links is read on demand — open a file only when its trigger hits.
+Global contract for coding agents on this machine (Claude Code, Codex, Cursor), installed at `~/.agent-harness`. Follow exactly. Everything linked here is read on demand.
 
 ## Setup
-- Secrets: `~/.agent-harness/.env` (gitignored). Pass keys by reference (`source`, `--env-file`) — never read, print, or commit values.
-- Personal rules: `~/.agent-harness/MACHINE.md` (gitignored). If present, it overrides these docs.
+- Secrets: `~/.agent-harness/.env` (gitignored). Pass keys by reference (`source`, `--env-file`); never read, print or commit values.
+- Personal rules: `~/.agent-harness/MACHINE.md` (gitignored) overrides this file.
 
 ## Rules
-Read the rules file for each stack you touch, before editing:
-- every task: `~/.agent-harness/rules/git.md` — worktree per task, branches, PRs, cleanup
-- `~/.agent-harness/rules/react.md`
-- `~/.agent-harness/rules/typescript.md`
-- `~/.agent-harness/rules/dotnet.md`
-- `~/.agent-harness/rules/python.md`
+Read the rules file for each stack before editing it: `~/.agent-harness/rules/git.md` (every task), `~/.agent-harness/rules/react.md`, `~/.agent-harness/rules/typescript.md`, `~/.agent-harness/rules/dotnet.md`, `~/.agent-harness/rules/python.md`.
 
-## Sub-agents
-Keep the main context clean: delegate everything not core to the current task to a sub-agent.
+## Work
+Solve every code change with `/loop [min|med|max] <task>` (`~/.agent-harness/skills/loop/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
 
-| Task | Skill | Tier |
+| Role | Tier | Job |
 |---|---|---|
-| git/gh: worktree, push, PR, cleanup | `~/.agent-harness/skills/git-ops.md` | small |
-| search: code, docs, web | `~/.agent-harness/skills/search.md` | small |
-| plan | `~/.agent-harness/skills/plan.md` | large |
-| implement | `~/.agent-harness/skills/implement.md` | medium |
-| review | `~/.agent-harness/skills/review.md` | large |
-| test | `~/.agent-harness/skills/test.md` | medium |
+| planner | large | decisions, parallel lanes, acceptance checks |
+| implementer | medium | code + unit tests, commit per issue, fixes |
+| tester | medium | gates + acceptance checks with evidence |
+| reviewer | large, re-review medium | findings file |
+| searcher | small | lookups |
 
-Tiers — Claude Code: haiku / sonnet / opus. Cursor, Codex: cheapest / default / strongest available.
-No sub-agent support? Run the skill inline, keep only its summary in context.
+Tiers — Claude Code: haiku / sonnet / opus. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
 
-## Loop
-Solve every task with the loop: `/loop [min|med|max] <task>`, default med. Stages, degrees, and fix rounds: `~/.agent-harness/skills/loop.md`.
-After a PR merges: `/cleanup` removes its worktree and branch.
+Git plumbing is scripted, no agent needed: `~/.agent-harness/bin/task-start`, `~/.agent-harness/bin/task-ship`, `~/.agent-harness/bin/task-cleanup`.
+
+## Cost
+The main session runs the most expensive model, so it only orchestrates: no code exploration, no reading source, no copying findings into briefs. Discovery belongs to the planner or searcher; details go through handoff files.
 
 ## Cache
-- Before exploring: check `~/.agent-harness/cache/INDEX.md`. Match → follow the recipe verbatim, but verify its output as usual.
-- After discovery-heavy work: save a recipe. See `~/.agent-harness/cache/README.md`.
+Private recipes in `~/.agent-harness/cache/recipes/<repo>/` are listed at session start by a hook (Cursor: `ls` that folder). A match → follow it verbatim, still verify. Discovery-heavy task → `/recipe`.

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/_lib.sh"
+usage="usage: task-ship <worktree> [pr-body-file] [title]"
+wt="${1:?$usage}"; body="${2:-}"; title="${3:-}"
+cd "$wt"
+branch="$(git branch --show-current)"
+default="$(harness_default_branch "$wt")"
+[ -n "$branch" ] && [ "$branch" != "$default" ] || { echo "refusing to ship '$branch' (default branch or detached)" >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "worktree has uncommitted changes; commit them first" >&2; git status --short >&2; exit 1; }
+[ "$(git rev-list --count "origin/$default..HEAD" 2>/dev/null || echo 1)" -gt 0 ] || { echo "no commits to ship" >&2; exit 1; }
+
+git push -q -u origin "$branch"
+if url="$(gh pr view "$branch" --json url,state -q 'select(.state=="OPEN").url' 2>/dev/null)" && [ -n "$url" ]; then
+  echo "pr=$url (already open, branch pushed)"
+  exit 0
+fi
+if [ -n "$body" ]; then
+  [ -n "$title" ] || title="$(git log --reverse --format=%s "origin/$default..HEAD" | head -1)"
+  url="$(gh pr create --base "$default" --head "$branch" --title "$title" --body-file "$body")"
+elif [ -n "$title" ]; then
+  url="$(gh pr create --base "$default" --head "$branch" --title "$title" --fill)"
+else
+  url="$(gh pr create --base "$default" --head "$branch" --fill)"
+fi
+echo "pr=$url"
