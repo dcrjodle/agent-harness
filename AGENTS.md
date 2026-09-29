@@ -10,23 +10,30 @@ Global contract for coding agents on this machine (Claude Code, Codex, Cursor), 
 Read the rules file for each stack before editing it: `~/.agent-harness/rules/git.md` (every task), `~/.agent-harness/rules/react.md`, `~/.agent-harness/rules/typescript.md`, `~/.agent-harness/rules/dotnet.md`, `~/.agent-harness/rules/python.md`.
 
 ## Work
-Solve every code change with `/solve [min|med|max] <task>` (`~/.agent-harness/skills/solve/SKILL.md`). Roles are in `~/.agent-harness/agents/`:
+Every code change goes through `/solve [inline|loop] <task>` (`~/.agent-harness/skills/solve/SKILL.md`):
+- **inline** (default): you do the work yourself in a task worktree. A UI change gets one verifier for screenshots, which you judge against the design.
+- **loop**: only for work that is both complex and broad (criteria in solve). You orchestrate and never read source.
+
+When unsure, inline. Don't split work or spawn agents that inline work doesn't need.
+
+Roles in `~/.agent-harness/agents/`, one job each:
 
 | Role | Tier | Job |
 |---|---|---|
-| planner | large | decisions, parallel lanes, acceptance checks |
-| implementer | large (medium for mechanical lanes) | product code, static checks, commit per issue, fixes; never tests |
-| tester | medium | writes and runs all automated tests |
-| verifier | medium | runs the app, verify checks, screenshots |
-| reviewer | large, re-review medium | findings file |
+| planner | large | plan and checks for a loop |
+| implementer | large | product code for one lane or one findings file |
+| tester | medium | writes and runs automated tests |
+| verifier | medium | runs the app, performs checks, saves screenshots |
+| designer | large | compares screenshots with the design |
+| reviewer | large | reviews the code diff |
 | searcher | small | lookups |
 
-Tiers — Claude Code: haiku / sonnet / opus. Large does the thinking (plan, code, first review), medium the procedural work (tests, app runs, re-reviews), small the lookups. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
+Tiers — Claude Code: haiku / sonnet / opus. Codex, Cursor: cheapest / default / strongest. No sub-agents → run the role file inline and keep only its output.
 
-Git plumbing is scripted, no agent needed: `~/.agent-harness/bin/task-start`, `~/.agent-harness/bin/task-ship`, `~/.agent-harness/bin/task-cleanup`.
+Git plumbing is scripted in `~/.agent-harness/bin/`: `task-start`, `task-fork`, `task-join`, `task-status`, `task-ship`, `task-cleanup`.
 
 ## Cost
-The main session runs the most expensive model, so it only orchestrates: no code exploration, no reading source, no copying findings into briefs. Discovery belongs to the planner or searcher; details go through handoff files.
+Tokens grow with turns × context, so long-running agents dominate cost. Keep each sub-agent short and single-purpose: a brief of a few lines, file paths instead of pasted content. For a new round, start a fresh agent with the findings file instead of resuming one with a large context. `~/.agent-harness/bin/stage-times` shows minutes and tokens per agent (`--roles` per role).
 
 ## Cache
 Private recipes in `~/.agent-harness/cache/recipes/<repo>/` are listed at session start by a hook (Cursor: `ls` that folder). A match → follow it verbatim, still verify. Discovery-heavy task → `/recipe`.

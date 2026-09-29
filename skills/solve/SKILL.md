@@ -1,59 +1,50 @@
 ---
 name: solve
-description: Solve a coding task end to end with the harness loop — task worktree, plan, parallel implementation, tests, app verification with screenshots, review, PR. Use for any change request in a git repo.
-argument-hint: "[min|med|max] <task or issue numbers>"
+description: Solve a coding task end to end — inline by default, the full parallel loop (plan, lanes, test, verify, design check, review) only for complex and broad work. Use for any change request in a git repo.
+argument-hint: "[inline|loop] <task or issue numbers>"
 ---
 Task: the user's request ($ARGUMENTS)
 
-You are the orchestrator, usually on the most expensive model. You never read or edit source files. You run scripts, brief roles, and pass file paths. Details live in handoff files, not in your context.
+## 1. Pick the mode
+The first word `inline|loop` wins. Otherwise use **inline**. Use **loop** only when at least two of these hold:
+- 3+ issues, or changes across several packages or areas that can run as parallel lanes;
+- a new design for state, data model, concurrency or persistence;
+- roughly 15+ files or 500+ changed lines.
 
-## 1. Pick the degree
-First word `min|med|max` wins. Otherwise choose:
-- **min** — one small, obvious change (≤2 files, no design). implement → test → ship.
-- **med** — one feature or fix. implement → test + verify → review → fix → ship.
-- **max** — more than 2 issues, new state/selection/concurrency/persistence logic, or an unclear design. plan → implement (lanes) → test + verify → review → fix → ship.
-
-Skip verify when nothing user-visible changed (no UI, no rendered output, no runtime behaviour a person would look at).
+One area or a long task alone is not enough. When unsure, inline.
 
 ## 2. Start
-- File issues first if the user asked for them (one `gh issue create` each).
-- `~/.agent-harness/bin/task-start <feat|fix|chore|refactor|docs|test> <slug>` prints `worktree=`, `branch=` and `handoff=`. All stages work in the worktree; all stage files go in the handoff dir (outside the repo).
-- Recipes for this repo were listed at session start. Name the matching recipe paths in every brief.
+- File issues first if the user asked for them.
+- `~/.agent-harness/bin/task-start <feat|fix|chore|refactor|docs|test> <slug>` prints `worktree=`, `branch=` and `handoff=`. Work only in the worktree; stage files go in the handoff dir, and `<handoff>/base` holds the base commit.
+- Follow a matching recipe verbatim; name it in every brief.
 
-## 3. Stages
-One sub-agent per stage, background, with the role file from `~/.agent-harness/agents/`. A brief is short: task or issue numbers, worktree, handoff paths, recipes, commit trailer. Never paste code, plans or findings into a brief; pass the path.
+## 3. Inline
+1. Write `<handoff>/checks.md`: 3–8 observable checks from the request, each tagged `test` or `verify`. A visual check names the screen, state, viewport widths, themes and the design reference (image path, Figma/Pencil node or URL).
+2. Implement. Run static checks and the tests for what you touched; add tests where behaviour changed. Commit per issue by file path.
+3. UI changed → spawn one verifier (brief: worktree, handoff, round 1). Don't edit while it runs. Then look at `<handoff>/shots/` yourself against the design reference, fix what differs, and rerun the verifier for failed checks only.
+4. Ship.
 
-| Stage | Role (tier) | Writes |
-|---|---|---|
-| plan (max) | planner (large) | `handoff/plan.md` |
-| implement | implementer (large), one per lane, lanes in parallel | commits (product code only) |
-| test | tester (medium) | test commits + `handoff/test.md` |
-| verify (med, max) | verifier (medium), in parallel with test | `handoff/verify.md` + `handoff/shots/` |
-| review | reviewer (large) | `handoff/review-1.md` |
-| fix | implementer (large) | `→ fixed/skipped` under each item |
-| retest / re-verify | tester / verifier, failed checks only | `handoff/test-N.md`, `handoff/verify-N.md` |
-| re-review | reviewer (medium), round 2 scope | `handoff/review-N.md` |
+## 4. Loop
+You orchestrate only: never read source; brief with paths, never pasted content. One background agent per stage, fresh for every round. A brief is: task or issue refs, worktree, handoff, round N, recipes, commit trailer.
 
-- **Separation of duties.** Implementers write product code and run only static checks (compile, typecheck, lint); a hook blocks them from running tests, apps, browsers or simulators. The tester owns every automated test. The verifier owns running the app and screenshots, so single-instance tools (a simulator, Blender, a game engine) have exactly one user.
-- **Shared worktree.** Parallel stages share one git index and one build output. Each stage commits only its own files, by file path (`~/.agent-harness/rules/git.md`). When test, verify and review overlap, one of them owns builds: the verifier while it runs (its app runs from that output), else the tester. Beside a verifier, brief the tester to run only what writes no build output; once verify returns, resume it for the build gates and any tests that build or start the app. Reviewers never build.
+1. **Plan** — planner writes `<handoff>/plan.md` and `<handoff>/checks.md`.
+2. **Implement** — lane 0 runs in the task worktree. When it has committed, fork every other lane: `task-fork <worktree> lane-N`, one implementer per fork, in parallel. When all return: `task-join <worktree> lane-N` for each. A conflict stops the loop: report it.
+3. **Check, in parallel**
+   - tester in the task worktree → `test-N.md`;
+   - verifier in a snapshot (`task-fork <worktree> verify --detach`) → `verify-N.md` and `shots/`; when checks have a design reference, then designer → `design-N.md`; `task-join <worktree> verify` when both are done;
+   - reviewer (round 1 large, later rounds medium) → `review-N.md`.
+4. **Status** — `task-status <handoff>` counts open blockers and majors. Zero → ship.
+5. **Fix** — one fresh implementer with the files that have open items. Then rerun only those stages as round N+1. At most 2 fix rounds; after that, ship with the rest under "Open items".
 
-- Pass medium/sonnet to an implementer only for mechanical lanes: docs, config, copy, renames, generated assets. Real code stays on large; a cheaper model that redoes work costs more.
-- Role files pin a default tier (e.g. reviewer pins large/opus). For re-review, override it down to medium/sonnet explicitly when launching that stage — the role file's pin is only the default, not a floor.
-- Lanes run in parallel only when the plan says their files are disjoint; lane 0 finishes first and is the only lane that builds shared outputs. Start verify after the last lane commits.
-- Test failures, verify failures and review findings all go to one fix stage. After a fix, rerun only what failed (retest and/or re-verify) and re-review.
-- At most 2 fix rounds. Then ship; whatever is still open goes into the PR body under "Open items" and into your final message.
+## 5. Ship
+- Write `<handoff>/pr.md` (loop: ask the last implementer): what changed, verification, open items, PR trailer.
+- `~/.agent-harness/bin/task-ship <worktree> <handoff>/pr.md "<title>"` prints the PR URL. It refuses while blockers or majors are open unless pr.md has an "Open items" heading. Don't merge unless asked.
+- The task needed more than 2 discovery steps → `/recipe`. After the PR merges → `~/.agent-harness/bin/task-cleanup`.
 
-## 4. Ship
-- The last implementer run writes `handoff/pr.md` (ask for it in the brief).
-- `~/.agent-harness/bin/task-ship <worktree> <handoff>/pr.md "<title>"` prints the PR URL. Don't merge unless the user asks.
-
-## 5. Finish
-- The task needed more than 2 discovery steps → `/recipe`.
-- After the PR merges: `~/.agent-harness/bin/task-cleanup` (run from the repo).
+## Findings
+Every stage file lists findings as `- [ ] <blocker|major|minor|nit> — <where> — <observed> — <expected or fix>`. The fixer marks `- [x] … → <sha>` or `- [-] … → skipped: <reason>`. Severity: blocker = crash, data loss, broken core flow · major = requirement not met, real bug, visible deviation from the design · minor = edge case, a11y, small visual drift · nit = style.
 
 ## Guardrails
-- Sub-agents never spawn sub-agents; one writer per file set.
-- Read a report for its verdict and counts; don't re-read the handoff file unless you must decide something.
-- A stage that returns without commits or files failed. Resume that same agent with the reason; don't launch a duplicate.
-- Implement failed (static checks red, no commits) → stop and report.
-- Stage timings: `~/.agent-harness/bin/stage-times`.
+- Sub-agents never spawn sub-agents.
+- A stage that returns without its file or commits failed: rerun it fresh with the reason.
+- Static checks red after implement → stop and report.
