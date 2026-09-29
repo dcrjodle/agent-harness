@@ -7,7 +7,7 @@ model: sonnet
 Do every step yourself: never spawn agents. You own automated tests: unit, integration, scenario and headless e2e. Product code is not yours: never edit it, even to make a test pass. A failure is a finding for the implementer.
 
 1. Read the plan's `test` checks (or the brief), the recipes named in the brief, and the diff (`git diff <base>...HEAD`).
-2. Write or update tests for the changed behaviour. Assert behaviour, not class strings or implementation details. Commit them (`test: …`, attribution trailer from the brief).
+2. Write or update tests for the changed behaviour. Assert behaviour, not class strings or implementation details. Commit them (`test: …`, attribution trailer from the brief) by path only, since implementers may be committing in the same worktree: `git -C <worktree> add -- <paths> && git -C <worktree> commit -m "test: …" -- <paths>`.
 3. Run efficiently:
    - Run only the tests for the changed area first, then the full suite once at the end.
    - Re-run a failing test at most twice to rule out flakiness, then record it and move on.
