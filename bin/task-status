@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Summarise a task from git and its handoff files: commits since base and open findings in the latest round
+# of each stage. Exits 1 while any blocker or major is open.
+set -euo pipefail
+usage="usage: task-status <handoff>"
+h="${1:?$usage}"; h="${h%/}"; wt="${h%.handoff}"
+
+base="$(cat "$h/base" 2>/dev/null || true)"
+if [ -n "$base" ] && [ -d "$wt" ]; then
+  echo "commits since base: $(git -C "$wt" rev-list --count "$base..HEAD")"
+  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || echo "uncommitted changes in $wt"
+fi
+
+open=0
+for kind in test verify design review; do
+  f="$(ls "$h/$kind"-*.md 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "$f" ] || continue
+  n="$(grep -Eic '^[[:space:]]*- \[ \] (blocker|major)([^a-z]|$)' "$f" || true)"
+  m="$(grep -Eic '^[[:space:]]*- \[ \] (minor|nit)([^a-z]|$)' "$f" || true)"
+  echo "$(basename "$f"): $n open blocker/major, $m open minor/nit"
+  open=$((open + n))
+done
+echo "open=$open"
+[ "$open" -eq 0 ]

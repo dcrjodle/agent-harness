@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fork a task worktree for a parallel stage: a lane on its own branch, or a detached snapshot (--detach).
+set -euo pipefail
+usage="usage: task-fork <worktree> <name> [--detach]"
+wt="${1:?$usage}"; name="${2:?$usage}"; mode="${3:-}"
+wt="$(cd "$wt" && pwd)"
+fork="$wt--$name"
+branch="$(git -C "$wt" branch --show-current)"
+[ -n "$branch" ] || { echo "task worktree is detached: $wt" >&2; exit 1; }
+
+if [ "$mode" = "--detach" ]; then
+  [ -e "$fork" ] && git -C "$wt" worktree remove --force "$fork"
+  git -C "$wt" worktree add -q --detach "$fork" HEAD
+else
+  [ -e "$fork" ] && { echo "fork exists: $fork (task-join it first)" >&2; exit 1; }
+  git -C "$wt" worktree add -q -b "$branch--$name" "$fork" HEAD
+fi
+
+# Clone installed dependencies and local env files so the fork runs without a fresh install.
+# cp -c is an APFS copy-on-write clone: near-instant and no extra disk.
+(cd "$wt" && find . -maxdepth 4 -type d -name node_modules -prune -print) | while read -r d; do
+  mkdir -p "$fork/$(dirname "$d")"
+  cp -cR "$wt/$d" "$fork/$d" 2>/dev/null || { rm -rf "$fork/$d"; cp -R "$wt/$d" "$fork/$d"; }
+done
+for f in "$wt"/.env "$wt"/.env.*; do
+  [ -f "$f" ] && [ ! -e "$fork/$(basename "$f")" ] && cp "$f" "$fork/"
+done
+
+echo "fork=$fork"
+[ "$mode" = "--detach" ] || echo "branch=$branch--$name"

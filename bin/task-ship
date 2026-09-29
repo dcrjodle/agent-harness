@@ -3,11 +3,21 @@ set -euo pipefail
 source "$(dirname "$0")/_lib.sh"
 usage="usage: task-ship <worktree> [pr-body-file] [title]"
 wt="${1:?$usage}"; body="${2:-}"; title="${3:-}"
+wt="$(cd "$wt" && pwd)"
+[ -z "$body" ] || body="$(cd "$(dirname "$body")" && pwd)/$(basename "$body")"
 cd "$wt"
 branch="$(git branch --show-current)"
 default="$(harness_default_branch "$wt")"
 [ -n "$branch" ] && [ "$branch" != "$default" ] || { echo "refusing to ship '$branch' (default branch or detached)" >&2; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "worktree has uncommitted changes; commit them first" >&2; git status --short >&2; exit 1; }
+# Open blockers or majors must be fixed or listed under an "Open items" heading in the PR body.
+if [ -d "$wt.handoff" ] && ! "$(dirname "$0")/task-status" "$wt.handoff" >/dev/null; then
+  if ! { [ -n "$body" ] && grep -Eqi '^(#+[[:space:]]*)?open items' "$body"; }; then
+    "$(dirname "$0")/task-status" "$wt.handoff" >&2 || true
+    echo "open blockers/majors: fix them or list them under an \"Open items\" heading in the PR body" >&2
+    exit 1
+  fi
+fi
 [ "$(git rev-list --count "origin/$default..HEAD" 2>/dev/null || echo 1)" -gt 0 ] || { echo "no commits to ship" >&2; exit 1; }
 
 git push -q -u origin "$branch"
