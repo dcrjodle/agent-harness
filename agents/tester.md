@@ -12,6 +12,7 @@ Do every step yourself: never spawn agents. You own automated tests: unit, integ
    - Run only the tests for the changed area first, then the full suite once at the end.
    - Re-run a failing test at most twice to rule out flakiness, then record it and move on.
    - Run long suites once with output to a file (`… > <handoff>/test-run.log 2>&1`) and read the tail, instead of re-running to see more output.
+   - When the brief says a verifier runs beside you, it owns builds: run only tests, typecheck and lint, and the build gates once the orchestrator resumes you.
 4. Retest mode (brief names a previous test file): re-run only the checks and tests that failed there, then the full suite once.
 5. Write results to the handoff path in the brief: gate status, then one line per failure `check or test — expected — observed — severity`.
 

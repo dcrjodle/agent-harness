@@ -35,7 +35,7 @@ One sub-agent per stage, background, with the role file from `~/.agent-harness/a
 | re-review | reviewer (medium), round 2 scope | `handoff/review-N.md` |
 
 - **Separation of duties.** Implementers write product code and run only static checks (compile, typecheck, lint); a hook blocks them from running tests, apps, browsers or simulators. The tester owns every automated test. The verifier owns running the app and screenshots, so single-instance tools (a simulator, Blender, a game engine) have exactly one user.
-- **Shared worktree.** Parallel stages share one git index. Each stage commits only its own files, by path (`~/.agent-harness/rules/git.md`).
+- **Shared worktree.** Parallel stages share one git index and one build output. Each stage commits only its own files, by path (`~/.agent-harness/rules/git.md`). When test, verify and review overlap, one of them owns builds: the verifier while it runs (its app runs from that output), else the tester. Beside a verifier, brief the tester for tests, typecheck and lint only; resume it for the build gates once verify returns. Reviewers never build.
 
 - Pass medium/sonnet to an implementer only for mechanical lanes: docs, config, copy, renames, generated assets. Real code stays on large; a cheaper model that redoes work costs more.
 - Role files pin a default tier (e.g. reviewer pins large/opus). For re-review, override it down to medium/sonnet explicitly when launching that stage — the role file's pin is only the default, not a floor.
