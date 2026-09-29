@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Merge a lane fork back into its task worktree (snapshots have nothing to merge) and remove the fork.
+set -euo pipefail
+usage="usage: task-join <worktree> <name>"
+wt="${1:?$usage}"; name="${2:?$usage}"
+wt="$(cd "$wt" && pwd)"
+fork="$wt--$name"
+[ -d "$fork" ] || { echo "no fork: $fork" >&2; exit 1; }
+
+fb="$(git -C "$fork" branch --show-current)"
+if [ -n "$fb" ]; then
+  [ -z "$(git -C "$fork" status --porcelain --untracked-files=no)" ] \
+    || { echo "fork has uncommitted changes: $fork" >&2; git -C "$fork" status --short >&2; exit 1; }
+  if ! git -C "$wt" merge -q --no-edit "$fb"; then
+    echo "conflict merging $fb into $wt; fork kept. Conflicting files:" >&2
+    git -C "$wt" diff --name-only --diff-filter=U >&2
+    git -C "$wt" merge --abort
+    exit 1
+  fi
+fi
+git -C "$wt" worktree remove --force "$fork"
+if [ -n "$fb" ]; then git -C "$wt" branch -q -d "$fb"; fi
+echo "joined $name"

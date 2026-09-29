@@ -24,6 +24,7 @@ done
 mkdir -p "$dir"
 git -C "$root" worktree add -q "$dir/$final" -b "$type/$final" "$base"
 mkdir -p "$dir/$final.handoff"
+git -C "$root" rev-parse "$base" > "$dir/$final.handoff/base"
 
 echo "worktree=$dir/$final"
 echo "branch=$type/$final"
