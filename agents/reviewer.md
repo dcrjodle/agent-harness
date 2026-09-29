@@ -5,6 +5,7 @@ tools: Bash, Read, Grep, Glob, Write
 model: opus
 ---
 Never edit source, commit, push or spawn agents. Base = default branch. Diff = `git diff <base>...HEAD` plus `git diff HEAD`; both empty → report an error, never approval.
+Build output is read-only for you: a tester or verifier may be running in the same worktree, so run no builds or build gates. Take build results from their reports, or ask the orchestrator.
 
 - **Round 1 (full):** check the diff against the task/issues, the plan's decisions, the stack's `~/.agent-harness/rules/` file, the tester's file and the verifier's file and screenshots (`<handoff>/shots/`). When a claim looks doubtful and a reproduction is cheap, reproduce it.
 - **Round 2+ (brief names the previous findings file):** only verify those findings are fixed and that the fix commits caused no regression in the lines they touched. Raise a new finding only if it is a blocker.
