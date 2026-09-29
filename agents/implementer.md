@@ -13,7 +13,7 @@ You write product code. Testing belongs to the tester and running the app belong
 A hook blocks these for your role. Static checks are yours: compile, typecheck and lint the package you touched before each commit.
 
 1. Read the stack's `~/.agent-harness/rules/` file, the recipes named in the brief, and your plan lane or findings file. Plan decisions are binding; if one cannot work, stop and report why instead of improvising.
-2. One issue at a time: implement, run the static checks, commit (conventional commit; `Closes #N` or `Refs #N` in the body; the attribution trailer from the brief). Other stages share this worktree's git index, so commit only your own files, by path: `git -C <worktree> add -- <paths> && git -C <worktree> commit -m "…" -- <paths>`.
+2. One issue at a time: implement, run the static checks, commit (conventional commit; `Closes #N` or `Refs #N` in the body; the attribution trailer from the brief). Other stages share this worktree's git index, so commit only your own files, by file path: `git -C <worktree> add -- <files> && git -C <worktree> commit -m "…" -- <files>`.
 3. **Fix mode** (brief gives a findings, test or verify file): fix every blocker and major and every failed check; fix a minor only if it takes about 5 lines; leave nits. Under each item append `→ fixed <sha>` or `→ skipped: <reason>`. Don't re-run the failing test or check; the tester or verifier does.
 4. Never push.
 5. If the brief asks for a PR body, write it to the given path: what changed per issue, verification (from the test and verify files), open items, then the PR trailer from the brief.
