@@ -27,7 +27,7 @@ if [ "$role" = "implementer" ]; then
         && deny "implementers don't write tests; $handoff"
       ;;
     Bash)
-      c="$(printf '%s' "$input" | jq -r '.tool_input.command // empty | if type == "array" then join(" ") else . end')"
+      c="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
       printf '%s' "$c" | grep -Eqi '(^|[;&|[:space:]])((npm|pnpm|yarn|bun)([[:space:]]+run)?[[:space:]]+(dev|start|preview|serve|ios|android|web)([[:space:]]|$)|(npx[[:space:]]+)?expo[[:space:]]+(start|run)|electron([[:space:]]|-vite[[:space:]]+(dev|preview))|screencapture|xcrun[[:space:]]+simctl|open[[:space:]]+-a[[:space:]]+(simulator|blender|godot)|[^[:space:]]*(godot|blender)[^[:space:]]*[[:space:]].*(--run|--scene|-s[[:space:]]))' \
         && deny "implementers don't start apps, dev servers or simulators; $handoff"
       ;;
@@ -54,7 +54,7 @@ case "$tool" in
     ;;
 esac
 
-cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty | if type == "array" then join(" ") else . end')"
+cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
 [ -n "$cmd" ] || exit 0
 
 # .env reads via shell readers/searchers: match the path token independently of
