@@ -1,0 +1,15 @@
+{
+  "name": "jobs",
+  "version": "0.1.0",
+  "description": "Every running Claude Code session as one list of jobs: start, highlight, merge, open, and answer plans",
+  "author": { "name": "Joel Bystedt" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openInDesktop": {
+      "type": "boolean",
+      "title": "Open in the desktop app",
+      "description": "Open the Jobs pane beside the conversation when the desktop app connects to a session",
+      "default": true
+    }
+  }
+}

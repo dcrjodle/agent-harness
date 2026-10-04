@@ -60,6 +60,19 @@ if [ -e "$HARNESS" ] && [ ! -L "$HARNESS" ]; then
 fi
 ln -sfn "$PWD" "$HARNESS"
 
+# Mods — every folder under mods/ is a Claude Code plugin, loaded through CLAUDE_CODE_PLUGIN_DIRS in settings.json
+if command -v jq >/dev/null; then
+  settings="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"; [ -s "$settings" ] || echo '{}' > "$settings"
+  [ -e "$settings.pre-harness" ] || cp "$settings" "$settings.pre-harness"
+  mods="$(for d in mods/*/; do [ -d "$d" ] && printf '~/.agent-harness/mods/%s:' "$(basename "$d")"; done; true)"
+  wired="$(mktemp)"
+  jq --arg mods "$mods" '
+    .env.CLAUDE_CODE_PLUGIN_DIRS = (reduce ($mods | split(":") | map(select(. != "")))[] as $m
+      ((.env.CLAUDE_CODE_PLUGIN_DIRS // "") | split(":") | map(select(. != "")); if any(.[]; . == $m) then . else . + [$m] end) | join(":"))
+  ' "$settings" > "$wired" && cat "$wired" > "$settings" && echo "mods wired into $settings"
+  rm -f "$wired"
+fi
+
 [ -f .env ] || cp .env.example .env
 [ -f MACHINE.md ] || printf '# Machine rules — personal, gitignored. Overrides repo docs. See MACHINE.example.md.\n' > MACHINE.md
 mkdir -p cache/recipes logs
