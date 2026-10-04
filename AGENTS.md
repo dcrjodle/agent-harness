@@ -35,5 +35,8 @@ Git plumbing is scripted in `~/.agent-harness/bin/`: `task-start`, `task-fork`, 
 ## Cost
 Tokens grow with turns × context, so long-running agents dominate cost. Keep each sub-agent short and single-purpose: a brief of a few lines, file paths instead of pasted content. For a new round, start a fresh agent with the findings file instead of resuming one with a large context. `~/.agent-harness/bin/stage-times` shows minutes and tokens per agent (`--roles` per role).
 
+## Observability
+Hooks report every session and sub-agent to the Observability mod; nothing to do for that. If the harness itself got in your way (a wrong recipe, a missing rule, a failing script), say so once: `~/.agent-harness/mods/observability/bin/observe <suggestion|error|note> "<text>"`.
+
 ## Cache
 Private recipes in `~/.agent-harness/cache/recipes/<repo>/` are listed at session start by a hook. A match → follow it verbatim, still verify. Discovery-heavy task → `/recipe`.

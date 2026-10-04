@@ -31,13 +31,13 @@ rewrite() {
   if jq "$@" "$file" > "$tmp"; then cat "$tmp" > "$file"; rm -f "$tmp"; else rm -f "$tmp"; echo "could not rewrite $file" >&2; return 1; fi
 }
 
-# Hooks are merged into settings.json: entries that are not the harness's stay as they are.
+# Hooks and the mod folder are merged into settings.json: entries that are not the harness's stay as they are.
 merge_settings() {
   local file="$CLAUDE/settings.json"
   command -v jq >/dev/null || { echo "jq not found: add the hooks to $file by hand (see README)"; return 0; }
   [ -s "$file" ] || echo '{}' > "$file"
   [ -e "$file.pre-harness" ] || cp "$file" "$file.pre-harness"
-  rewrite "$file" "$STRIP"'
+  rewrite "$file" --arg mod '~/.agent-harness/mods/observability' "$STRIP"'
     def wire(ev; name; matcher): .hooks[ev] += [(if matcher == "" then {} else {matcher: matcher} end)
       + {hooks: [{type: "command", command: ("f=\"$HOME/.agent-harness/hooks/" + name + "\"; [ -x \"$f\" ] || exit 0; exec \"$f\"")}]}];
     def wire(ev; name): wire(ev; name; "");
@@ -45,7 +45,10 @@ merge_settings() {
     | wire("SessionStart"; "session-context.sh")
     | wire("PreToolUse"; "guard.sh"; "Bash|Agent|Task|Read|Grep|Edit|Write|mcp__.*")
     | wire("SubagentStart"; "stage-log.sh") | wire("SubagentStop"; "stage-log.sh")
-  ' && echo "hooks merged into $file (backup: $file.pre-harness)"
+    | wire("PreToolUse"; "observe.sh"; "Agent|Task") | wire("PostToolUse"; "observe.sh"; "Agent|Task")
+    | reduce ("SessionStart", "UserPromptSubmit", "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop", "StopFailure", "SessionEnd") as $ev (.; wire($ev; "observe.sh"))
+    | .env.CLAUDE_CODE_PLUGIN_DIRS = ((((.env.CLAUDE_CODE_PLUGIN_DIRS // "") | split(":") | map(select(. != "" and . != $mod))) + [$mod]) | join(":"))
+  ' && echo "hooks and the observability mod merged into $file (backup: $file.pre-harness)"
 }
 
 if [ -e "$HARNESS" ] && [ ! -L "$HARNESS" ]; then
@@ -57,9 +60,9 @@ ln -sfn "$PWD" "$HARNESS"
 [ -f .env ] || cp .env.example .env
 [ -f MACHINE.md ] || printf '# Machine rules — personal, gitignored. Overrides repo docs. See MACHINE.example.md.\n' > MACHINE.md
 mkdir -p cache/recipes logs
-chmod +x bin/* hooks/*.sh
+chmod +x bin/* hooks/*.sh mods/*/bin/*
 
-# Roles, skills, hooks and the CLAUDE.md import
+# Roles, skills, hooks, the observability mod and the CLAUDE.md import
 mkdir -p "$CLAUDE/agents" "$CLAUDE/skills" "$CLAUDE/commands"
 for f in agents/*.md; do link "$HARNESS/$f" "$CLAUDE/agents/$(basename "$f")"; done
 for d in skills/*/; do n="$(basename "$d")"; link "$HARNESS/skills/$n" "$CLAUDE/skills/$n"; done
@@ -82,4 +85,4 @@ if [ -d "$HOME/.codex" ]; then
   fi
 fi
 
-echo "harness linked at $HARNESS — edit .env and MACHINE.md, then restart Claude Code to load the hooks"
+echo "harness linked at $HARNESS — edit .env and MACHINE.md, then restart Claude Code to load the hooks and the mod"
