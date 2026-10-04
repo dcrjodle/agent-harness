@@ -1,0 +1,39 @@
+{
+  "name": "code-quality",
+  "version": "0.1.0",
+  "description": "Code quality scores per recent repository, scored daily by one cloud routine per repo, with suggestions to file as issues or start as sessions",
+  "author": { "name": "Joel Bystedt" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openInDesktop": {
+      "type": "boolean",
+      "title": "Open in the desktop app",
+      "description": "Open the Code quality pane beside the conversation when the desktop app connects to a session",
+      "default": true
+    },
+    "repos": {
+      "type": "number",
+      "title": "Repositories",
+      "description": "How many recent repositories the dashboard shows",
+      "default": 6
+    },
+    "scanHourUtc": {
+      "type": "number",
+      "title": "Scan hour (UTC)",
+      "description": "Hour of the day, in UTC, at which new daily scans are scheduled",
+      "default": 4
+    },
+    "model": {
+      "type": "string",
+      "title": "Scan model",
+      "description": "Model the cloud routine scans with",
+      "default": "claude-sonnet-5-5"
+    },
+    "environmentId": {
+      "type": "string",
+      "title": "Cloud environment",
+      "description": "Environment id the scans run in; empty reuses the one your other routines run in",
+      "default": ""
+    }
+  }
+}

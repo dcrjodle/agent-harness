@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -u
+usage="usage: recent-repos [projects-to-scan]"
+scan="${1:-60}"
+case "$scan" in ''|*[!0-9]*) echo "$usage" >&2; exit 2 ;; esac
+
+dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+[ -d "$dir" ] || exit 0
+
+seen=$'\n'
+while IFS= read -r project; do
+  transcript="$(ls -1t "$dir/$project"/*.jsonl 2>/dev/null | head -n 1)"
+  [ -n "$transcript" ] || continue
+  cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$transcript")"
+  cwd="${cwd#\"cwd\":\"}"; cwd="${cwd%\"}"
+  case "$cwd" in /*) ;; *) continue ;; esac
+  while [ ! -d "$cwd" ] && [ "$cwd" != "/" ]; do cwd="$(dirname "$cwd")"; done
+
+  common="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || continue
+  if [ "$(basename "$common")" = ".git" ]; then
+    root="$(dirname "$common")"
+  else
+    root="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)" || continue
+  fi
+  remote="$(git -C "$cwd" remote get-url origin 2>/dev/null)" || continue
+  slug="$(printf '%s\n' "$remote" | sed -nE 's#^(https://|ssh://git@|git@)github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?$#\2#p')"
+  slug="${slug%.git}"
+  [ -n "$slug" ] || continue
+
+  case "$seen" in *$'\n'"$slug"$'\n'*) continue ;; esac
+  seen="$seen$slug"$'\n'
+  used="$(stat -f %m "$transcript" 2>/dev/null || stat -c %Y "$transcript" 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\n' "$slug" "$root" "$used"
+done < <(ls -1t "$dir" | head -n "$scan")
