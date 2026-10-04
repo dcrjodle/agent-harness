@@ -48,5 +48,14 @@ The clone is symlinked to `~/.agent-harness`. Each CLI's user config then points
 - **Mechanical gates.** Every stage file uses one checkbox line per finding; `task-status` counts the open blockers and majors, and `task-ship` refuses while any are open unless the PR lists them under "Open items". At most 2 fix rounds.
 - **Files, not context.** Plans, checks, findings, screenshots and PR bodies live in `~/.agent-worktrees/<repo>/<slug>.handoff/`.
 
+## Jobs
+`mods/jobs/` is a Claude Code mod: a pane that lists every running session on the machine as jobs and starts more. The desktop app opens it beside the conversation; `/jobs` opens it anywhere. Setup lists every folder under `mods/` in `env.CLAUDE_CODE_PLUGIN_DIRS` of `~/.claude/settings.json`; `claude plugin validate mods/jobs` checks the mod.
+
+- **List.** One centered column, read from `claude agents --json`: plans awaiting approval first, then sessions waiting for you, working and idle.
+- **Start.** A prompt on top, the three most used repos as chips above it (the most used one selected) and a searchable menu for the rest. Enter starts the job in plan mode; Enter with cmd or option held, which reaches the field as a line break, starts it without, as does the button beside it. The desktop app starts a session only on the person's click, so there a job is queued as a chip in the chat; in a terminal it runs as a `claude --bg` session.
+- **Highlight, menu, merge.** A click on a row's marker, or a shift- or ctrl-click, highlights several jobs; a right click opens the menu of that job or of the highlighted group. Merge hands the other jobs' plans and last messages to one session, then stops and archives the rest (the app asks before it archives).
+- **Open.** A click shows the job's own chat in split view, or in the app's main view when the app refuses the split.
+- **Plans.** A click on a plan opens it in the pane's sidebar with a reply field at the bottom: Enter closes the sidebar, interrupts the pending approval and sends the changes, and the rewrite runs as that job's next turn.
+
 ## License
 [MIT](LICENSE)
