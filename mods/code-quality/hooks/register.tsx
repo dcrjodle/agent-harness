@@ -7,7 +7,7 @@ import { OPENERS, issueCommand, issueNumber, issueUrlIn, sessionLink, sessionPro
 import { parseRepos } from './repos'
 import type { Found } from './repos'
 import { parseReport } from './report'
-import { answerOf, listingOf, routineBody, scanTime } from './routines'
+import { answerOf, createdOf, listingOf, routineBody, scanTime } from './routines'
 import type { Answer, Listing, Schedule } from './routines'
 import { DOCK_COLUMNS, dashboard, issueKey, runKey } from './view'
 import type { Actions } from './view'
@@ -115,6 +115,7 @@ async function hydrate($: EngineInterface): Promise<void> {
 type Call =
   | { action: 'list' }
   | { action: 'create'; body: Record<string, unknown> }
+  | { action: 'update'; trigger_id: string; body: Record<string, unknown> }
   | { action: 'run'; trigger_id: string }
   | { action: 'get_run_log'; session_id: string }
 
@@ -147,14 +148,23 @@ async function listRoutines($: EngineInterface): Promise<Listing | { error: stri
   return answer.isOk ? listingOf(answer.body) : { error: answer.reason }
 }
 
-async function createRoutine($: EngineInterface, slug: string, schedule: Schedule): Promise<string | null> {
-  const answer = await trigger(
-    $,
-    { action: 'create', body: routineBody(slug, schedule, crypto.randomUUID()) },
-    `The user pressed "Schedule daily scan" for ${slug} in the Code quality pane and confirmed creating its daily cloud routine.`,
-  )
+async function createRoutine(
+  $: EngineInterface,
+  slug: string,
+  schedule: Schedule,
+): Promise<{ error: string } | { warning: string | null }> {
+  const consent = `The user pressed "Schedule daily scan" for ${slug} in the Code quality pane and confirmed creating its daily cloud routine.`
+  const answer = await trigger($, { action: 'create', body: routineBody(slug, schedule, crypto.randomUUID()) }, consent)
 
-  return answer.isOk ? null : answer.reason
+  if (!answer.isOk) return { error: answer.reason }
+  const made = createdOf(answer.body)
+
+  if (made === null || !made.hasConnectors) return { warning: null }
+  const cleared = await trigger($, { action: 'update', trigger_id: made.id, body: { clear_mcp_connections: true } }, consent)
+
+  return {
+    warning: cleared.isOk ? null : `Scheduled ${slug}, but its connectors are still attached: detach them at claude.ai/code/routines`,
+  }
 }
 
 async function runRoutine($: EngineInterface, slug: string, id: string): Promise<string | null> {
@@ -341,9 +351,12 @@ async function scheduleScan($: EngineInterface, settings: Settings, repo: Repo):
       .catch(() => 'Cancel')
 
     if (answer !== 'Schedule') return ''
-    const failure = await createRoutine($, repo.slug, { environment: target, hourUtc: settings.hourUtc, model: settings.model })
+    const made = await createRoutine($, repo.slug, { environment: target, hourUtc: settings.hourUtc, model: settings.model })
 
-    if (failure !== null) return `Could not schedule ${repo.slug}: ${failure}`
+    if ('error' in made) return `Could not schedule ${repo.slug}: ${made.error}`
+    await load($, settings, true)
+
+    return made.warning ?? `Daily scan scheduled for ${repo.slug}`
   }
   await load($, settings, true)
 

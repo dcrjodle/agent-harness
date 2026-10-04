@@ -79,6 +79,14 @@ export function listingOf(body: unknown): Listing {
   return { routines, environment }
 }
 
+export function createdOf(body: unknown): { id: string; hasConnectors: boolean } | null {
+  const made = field(body, 'trigger')
+  const id = text(field(made, 'id'))
+  const connections = field(made, 'mcp_connections')
+
+  return id === null ? null : { id, hasConnectors: Array.isArray(connections) && connections.length > 0 }
+}
+
 export function scanMinute(slug: string): number {
   let sum = 0
 

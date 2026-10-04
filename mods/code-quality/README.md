@@ -22,7 +22,7 @@ It needs `git`, a signed-in `gh` for issues, and a claude.ai login for the routi
 
 ## How a scan reaches the pane
 
-Each routine is named `code-quality: <owner>/<repo>`, has that repository as its only source and reads it with `Bash`, `Read`, `Glob` and `Grep`. It writes nothing to the repository. It prints its result into its own run log, one record per line:
+Each routine is named `code-quality: <owner>/<repo>`, has that repository as its only source and reads it with `Bash`, `Read`, `Glob` and `Grep`. The server attaches your claude.ai connectors to a new routine by default; the mod detaches them right after creating it, since a scan needs none. It writes nothing to the repository. It prints its result into its own run log, one record per line:
 
 ```
 {"cq":1,"k":"scores","m":78,"r":64,"s":80,"t":41}

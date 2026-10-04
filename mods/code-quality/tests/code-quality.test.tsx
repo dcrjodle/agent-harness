@@ -75,6 +75,8 @@ const questionOf = (questions: unknown): string => {
     : ''
 }
 
+const CREATED = { trigger: { id: 'trig_new', mcp_connections: [{ name: 'Gmail' }] } }
+
 type World = { runs: string[][]; triggers: Record<string, unknown>[]; fills: string[]; answer: string; here: string | null }
 
 function world(on: On): World {
@@ -100,6 +102,8 @@ function world(on: On): World {
   on('tool.call', { tool: 'RemoteTrigger' }, (_$, e) => {
     seen.triggers.push({ ...e })
     if (e.action === 'get_run_log') return { result: { status: 200, json: '{}', summary: LOG } }
+
+    if (e.action === 'create') return { result: { status: 200, json: JSON.stringify(CREATED) } }
 
     return { result: { status: 200, json: JSON.stringify(e.action === 'list' ? ROUTINES : {}) } }
   })
@@ -230,7 +234,7 @@ test('terminal: Session fills the prompt box when the session is in that repo', 
   expect(seen.runs.some(run => run[0] === 'open')).toBe(false)
 })
 
-test('Schedule creates one daily routine per repo, only after a yes', async ($, on) => {
+test('Schedule creates one daily routine per repo, only after a yes, and detaches its connectors', async ($, on) => {
   const seen = world(on)
   const ui = await $.ui.mount({ ...pane(100), surface: 'desktop' })
   const created = (): Record<string, unknown>[] => seen.triggers.filter(call => call['action'] === 'create')
@@ -258,6 +262,9 @@ test('Schedule creates one daily routine per repo, only after a yes', async ($, 
       },
     },
   })
+  expect(seen.triggers.filter(call => call['action'] === 'update')).toMatchObject([
+    { trigger_id: 'trig_new', body: { clear_mcp_connections: true } },
+  ])
 })
 
 test('Scan now runs the routine the repo already has', async ($, on) => {
