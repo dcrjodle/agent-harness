@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# The observability endpoint. Every analytics event and free message enters the store here, one JSON line
+# per event in <store>/<session-id>.jsonl, and every reader (the mod's pane, the export) leaves through it.
+#   observe push                                 one JSON event on stdin: {session, event, ...}
+#   observe <suggestion|error|note> [--agent <id>] [--session <id>] <text>
+#   observe list [N]                             the newest N sessions (default 30) as a JSON array
+#   observe export <session-id> [--no-events] [-o <file>]
+#   observe dir                                  where the store is
+# HARNESS_OBSERVE_DIR moves the store, for a trial run that should not touch the real one.
+set -euo pipefail
+mod="$(cd "$(dirname "$0")/.." && pwd)"
+store="${HARNESS_OBSERVE_DIR:-$HOME/.agent-harness/logs/observability}"
+usage() { sed -n '4,8p' "$0" | sed 's/^#   /  /' >&2; exit 2; }
+view() { jq -L "$mod/lib" --slurpfile prices "$mod/prices.json" "$@"; }
+
+# Appends one event, stamped with the time it arrived. The session id names the file, so it must be one.
+push() {
+  local line session
+  line="$(jq -c 'select(type == "object" and (.session | type) == "string" and (.event | type) == "string")
+    | {ts: (now | (. * 1000 | floor) as $ms | ($ms / 1000 | floor | todate | .[0:19]) + "." + ("00" + ($ms % 1000 | tostring))[-3:] + "Z")} + .')" || return 2
+  session="$(printf '%s' "$line" | jq -r '.session')"
+  case "$session" in ""|*[!A-Za-z0-9_-]*) echo "observe: event needs a session id and an event name" >&2; return 2 ;; esac
+  mkdir -p "$store"
+  printf '%s\n' "$line" >> "$store/$session.jsonl"
+}
+
+case "${1:-}" in
+  push) push ;;
+  suggestion|error|note)
+    kind="$1"; shift; agent=""; session="${CLAUDE_CODE_SESSION_ID:-}"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --agent) agent="${2:-}"; shift 2 || usage ;;
+        --session) session="${2:-}"; shift 2 || usage ;;
+        *) break ;;
+      esac
+    done
+    text="$*"
+    [ -n "$text" ] || usage
+    [ -n "$session" ] || { echo "observe: no session id (set CLAUDE_CODE_SESSION_ID or pass --session)" >&2; exit 2; }
+    jq -nc --arg session "$session" --arg agent "$agent" --arg kind "$kind" --arg text "$text" --arg cwd "$PWD" \
+      '{session: $session, event: "message", kind: $kind, text: $text, cwd: $cwd} + (if $agent == "" then {} else {agent: $agent} end)' | push
+    echo "recorded $kind"
+    ;;
+  list)
+    n="${2:-30}"; files=()
+    while IFS= read -r f; do files+=("$f"); done < <(ls -t "$store"/*.jsonl 2>/dev/null | head -n "$n")
+    [ ${#files[@]} -gt 0 ] || { echo '[]'; exit 0; }
+    view -n -R 'include "observe"; [inputs as $line | {file: input_filename, event: ($line | fromjson?)}]
+      | group_by(.file) | map(map(.event) | try (view($prices[0]) | .session) catch empty) | sort_by(.last_at) | reverse' "${files[@]}"
+    ;;
+  export)
+    id="${2:-}"; [ -n "$id" ] || usage; shift 2; events=true; out=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-events) events=false; shift ;;
+        -o) out="${2:-}"; shift 2 || usage ;;
+        *) usage ;;
+      esac
+    done
+    case "$id" in *[!A-Za-z0-9_-]*) echo "observe: bad session id" >&2; exit 2 ;; esac
+    [ -f "$store/$id.jsonl" ] || { echo "observe: no session $id in $store" >&2; exit 1; }
+    doc="$(view -n -R --argjson events "$events" 'include "observe"; [inputs | fromjson?]
+      | view($prices[0]) + (if $events then {events: .} else {} end)' "$store/$id.jsonl")"
+    if [ -n "$out" ]; then mkdir -p "$(dirname "$out")"; printf '%s\n' "$doc" > "$out"; echo "$out"; else printf '%s\n' "$doc"; fi
+    ;;
+  dir) echo "$store" ;;
+  *) usage ;;
+esac

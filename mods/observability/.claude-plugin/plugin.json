@@ -1,0 +1,15 @@
+{
+  "name": "observability",
+  "version": "0.1.0",
+  "description": "Sessions, their agents as a graph, cost, time and free messages, fed by the harness hooks",
+  "author": { "name": "Joel Bystedt" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openInDesktop": {
+      "type": "boolean",
+      "title": "Open in the desktop app",
+      "description": "Open the Observability pane beside the conversation when the desktop app connects to a session",
+      "default": true
+    }
+  }
+}
