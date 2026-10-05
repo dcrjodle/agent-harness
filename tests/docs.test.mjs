@@ -175,12 +175,13 @@ describe("H-F the session log is documented and the public repo is clean", () =>
 
   describe("F2 the public repo", () => {
     // The patterns are written in pieces so that this file does not match itself.
-    const forbidden = [
-      new RegExp(["supabase", "co"].join("\\.")),
-      new RegExp(`${"sb_" + "secret_"}[A-Za-z0-9]{8}`),
-      new RegExp(`${"sb_" + "publishable_"}[A-Za-z0-9]{8}`),
-      new RegExp(`/${"Us"}${"ers"}/`),
+    const patterns = [
+      ["supabase", "co"].join("\\."),
+      `${"sb_" + "secret_"}[A-Za-z0-9]{8}`,
+      `${"sb_" + "publishable_"}[A-Za-z0-9]{8}`,
+      `/${"Us"}${"ers"}/`,
     ];
+    const forbidden = patterns.map((pattern) => new RegExp(pattern));
 
     it("no added line holds a project URL, a key or a machine path", (t) => {
       const base = sessionsBase();
@@ -191,6 +192,12 @@ describe("H-F the session log is documented and the public repo is clean", () =>
         .split("\n")
         .filter((line) => line.startsWith("+") && forbidden.some((re) => re.test(line)));
       assert.deepEqual(found, []);
+    });
+
+    it("no tracked file at all holds a project URL, a key or a machine path", () => {
+      const r = git("grep", "-n", "-E", ...patterns.flatMap((pattern) => ["-e", pattern]), "--", ".");
+      assert.equal(r.status, 1, `git grep found:\n${r.stdout}${r.stderr}`);
+      assert.equal(r.stdout, "");
     });
 
     it("tests use no secret but the fake's", () => {

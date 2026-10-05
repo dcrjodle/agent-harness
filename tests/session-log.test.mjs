@@ -802,3 +802,31 @@ describe("H-A bin/session-log", () => {
     });
   });
 });
+
+describe("H-A the tests keep out of the real harness, Supabase and Jev", () => {
+  const s = scratch("harness-isolation-");
+  after(() => s.remove());
+
+  it("the environment a test process gets holds nothing of the tester's own", () => {
+    const env = s.env();
+    assert.equal(env.HOME, s.home);
+    assert.equal("CLAUDE_CODE_SESSION_ID" in env, false, "the tester's Claude Code session id would let bin/decide log to it");
+    assert.deepEqual(Object.keys(env).filter((key) => /^(CLAUDE|ANTHROPIC|OPENAI|GITHUB|COCKPIT|TYPESAFE|SUPABASE|HARNESS)/.test(key)), []);
+  });
+
+  it("a test sets the session id itself, or leaves it out", () => {
+    assert.equal(s.env({ CLAUDE_CODE_SESSION_ID: "s10" }).CLAUDE_CODE_SESSION_ID, "s10");
+    assert.equal("CLAUDE_CODE_SESSION_ID" in s.env({ CLAUDE_CODE_SESSION_ID: undefined }), false);
+  });
+
+  it("run() refuses to start a process without an explicit environment", async () => {
+    await assert.rejects(() => run("true", [], {}), /explicit env/);
+  });
+
+  it("the helpers only accept a loopback URL for Supabase and Jev", () => {
+    assert.throws(() => supabaseEnv("https://example.com"), /loopback/);
+    assert.throws(() => supabaseEnv(""), /loopback/);
+    assert.throws(() => decide(s, makeHarness(s), ["check"], { url: "https://api.typesafe.ai" }), /loopback/);
+    assert.match(supabaseEnv("http://127.0.0.1:9"), /^COCKPIT_SUPABASE_URL=http:\/\/127\.0\.0\.1:9\n/);
+  });
+});
