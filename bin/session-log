@@ -10,6 +10,7 @@
 // is ever printed. Without them the events wait.
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -19,8 +20,9 @@ const { execFileSync, spawn } = require("node:child_process");
 
 const USAGE = `usage:
   session-log hook     queue the event of a Claude Code hook payload (stdin) and flush in the background
-  session-log flush    send the waiting events now: "sent N, waiting M, rejected R"
-  session-log status   whether the Supabase keys are set; the waiting and rejected events
+  session-log flush    send the waiting events now: "sent N, waiting M, rejected R"; on stderr,
+                       "stopped: <why>" when events still wait
+  session-log status   whether the Supabase keys are set and usable; the waiting and rejected events
 `;
 
 const SCRIPT_ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
@@ -29,11 +31,17 @@ const OUTBOX = path.join(DIR, "logs", "session-outbox");
 const REJECTED = path.join(OUTBOX, "rejected");
 const LOCK = path.join(OUTBOX, ".lock");
 const EVENT_FILE = /^\d{13}-\d+-\d{4}\.json$/;
+const STRAY_FILE = /^\.(?:\d{13}-\d+-\d{4}\.json\.tmp|lock\.\d+-[0-9a-f]{16})$/;
 const MAX_WAITING = 10000;
+const MAX_REJECTED = 1000;
+const STRAY_STALE_MS = 60000;
 const REQUEST_TIMEOUT_MS = 3000;
 const RUN_MS = 25000;
 const LOCK_STALE_MS = 60000;
 const LOCK_POLL_MS = 100;
+const LOCK_TOKEN = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+const LOOPBACK = /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/;
+const BAD_URL = "invalid COCKPIT_SUPABASE_URL (https, or http on loopback only)";
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const LEVEL = /^[a-z][a-z0-9-]{0,23}$/;
 const POINTS = ["level", "recipe", "ui"];
@@ -46,13 +54,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------- events ----------
 
-// Whitespace runs → one space, trimmed, other control characters dropped; over `limit` code points →
-// the first limit − 1 and "…"; empty → null.
+// Control characters that are not blanks dropped, then whitespace runs → one space, trimmed (in this
+// order, so clipping a clipped text changes nothing); over `limit` code points → the first limit − 1
+// and "…"; empty → null.
 function clip(value, limit) {
   if (typeof value !== "string") return null;
   const text = (value.toWellFormed ? value.toWellFormed() : value)
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f]/g, "")
     .replace(/\s+/g, " ")
-    .replace(/[\u0000-\u001f\u007f]/g, "")
     .trim();
   if (!text) return null;
   const points = [...text];
@@ -113,11 +122,13 @@ function git(dir, args) {
   }
 }
 
-// owner/name: the last two path parts of the origin remote's URL (".git" cut), else the main checkout
-// folder's name, else the folder's name.
+// owner/name: the last two path parts of the origin remote's URL (".git" cut; the scheme and any user or
+// password before the host left out first), else the main checkout folder's name, else the folder's name.
 function repoOf(dir) {
   if (typeof dir !== "string" || !dir) return null;
-  const url = git(dir, ["remote", "get-url", "origin"]);
+  const url = git(dir, ["remote", "get-url", "origin"])
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/([^@/]*@)?/i, "")
+    .replace(/^[^@/:]*@/, "");
   const parts = url.replace(/\.git$/, "").split(/[/:]+/).filter(Boolean);
   if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
   const common = git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
@@ -162,10 +173,22 @@ function queue(events) {
       } catch {}
     }
   }
-  const names = waiting();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(OUTBOX);
+  } catch {}
+  const names = entries.filter((name) => EVENT_FILE.test(name)).sort();
   for (const name of names.slice(0, Math.max(0, names.length - MAX_WAITING))) {
     try {
       fs.unlinkSync(path.join(OUTBOX, name));
+    } catch {}
+  }
+  // A writer killed between its write and its rename leaves its dot-file behind, a flusher killed while
+  // taking a stale lock over leaves the lock it moved aside.
+  for (const name of entries.filter((entry) => STRAY_FILE.test(entry))) {
+    const file = path.join(OUTBOX, name);
+    try {
+      if (Date.now() - fs.lstatSync(file).mtimeMs > STRAY_STALE_MS) fs.unlinkSync(file);
     } catch {}
   }
   return queued;
@@ -183,7 +206,24 @@ const waiting = () => listEvents(OUTBOX);
 
 // ---------- keys ----------
 
-// The Supabase URL and secret key from <dir>/.env only; `missing` names the absent ones.
+// The key travels only over https; plain http is for a loopback host (tests).
+function safeUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK.test(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
+// Why nothing can be sent ("missing …" or BAD_URL), or null when the keys are usable.
+function problem(cred) {
+  if (cred.missing.length) return `missing ${cred.missing.join(", ")}`;
+  return cred.invalid ? BAD_URL : null;
+}
+
+// The Supabase URL and secret key from <dir>/.env only; `missing` names the absent ones, `invalid` says
+// the URL is set but not safe to send the key to.
 function credentials() {
   let env = {};
   try {
@@ -195,7 +235,7 @@ function credentials() {
   const missing = [];
   if (!url) missing.push("COCKPIT_SUPABASE_URL");
   if (!key) missing.push("COCKPIT_SUPABASE_SECRET_KEY");
-  return { base: `${url.replace(/\/+$/, "")}/rest/v1`, key, missing };
+  return { base: `${url.replace(/\/+$/, "")}/rest/v1`, key, missing, invalid: Boolean(url) && !safeUrl(url) };
 }
 
 // ---------- writes ----------
@@ -297,17 +337,26 @@ async function send(cred, req) {
   }
 }
 
-// Moves an event that can never be written to rejected/, with the reason beside it.
+// Moves an event that can never be written to rejected/, with the reason beside it, and keeps only the
+// newest MAX_REJECTED there (a refusal that repeats for every event must not fill the disk).
 function reject(name, reason) {
   try {
     fs.mkdirSync(REJECTED, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(REJECTED, `${name}.reason`), `${reason}\n`, { mode: 0o600 });
     fs.renameSync(path.join(OUTBOX, name), path.join(REJECTED, name));
+    fs.writeFileSync(path.join(REJECTED, `${name}.reason`), `${reason}\n`, { mode: 0o600 });
   } catch {}
+  const names = listEvents(REJECTED);
+  for (const old of names.slice(0, Math.max(0, names.length - MAX_REJECTED))) {
+    for (const file of [old, `${old}.reason`]) {
+      try {
+        fs.unlinkSync(path.join(REJECTED, file));
+      } catch {}
+    }
+  }
   return "rejected";
 }
 
-// → "sent" | "rejected" | "stop" (keep it and every later event) | "gone" (deleted meanwhile)
+// → "sent" | "rejected" | "gone" (deleted meanwhile) | { stop: why } (keep it and every later event)
 async function sendEvent(cred, name, ensured) {
   let e;
   try {
@@ -317,8 +366,9 @@ async function sendEvent(cred, name, ensured) {
   }
   if (!validEvent(e)) return reject(name, "invalid event");
   for (const req of requests(e, ensured)) {
+    if (!holdLock()) return { stop: "another flush took the lock over" };
     const r = await send(cred, req);
-    if (r.stop) return "stop";
+    if (r.stop) return { stop: r.stop };
     if (r.reject) return reject(name, r.reject);
     if (req.ensures) ensured.add(req.ensures);
   }
@@ -330,42 +380,82 @@ async function sendEvent(cred, name, ensured) {
 
 // ---------- flush ----------
 
-// One flusher at a time: the lock is a directory, taken over once older than LOCK_STALE_MS. A second
-// flusher waits up to RUN_MS for it, and gives up as soon as nothing waits (the holder sends it all).
+// One flusher at a time. The lock is the file .lock holding its flusher's LOCK_TOKEN. The holder checks
+// that the lock is still its own, and refreshes its time, before every request, and stops once it is not.
+// A lock untouched for LOCK_STALE_MS (its flusher died, or the machine slept) is taken over. A second
+// flusher waits up to RUN_MS, and gives up as soon as nothing waits (the holder sends it all). Each pass
+// either sleeps or removes a stale lock, so waiting never spins. → "" once held, else why not.
 async function lock() {
   const until = Date.now() + RUN_MS;
   for (;;) {
     try {
-      fs.mkdirSync(LOCK);
-      return true;
+      fs.writeFileSync(LOCK, LOCK_TOKEN, { flag: "wx", mode: 0o600 });
+      return "";
     } catch (err) {
-      if (!err || err.code !== "EEXIST") return false;
+      if (!err || err.code !== "EEXIST") return `the lock cannot be made (${(err && err.code) || "error"})`;
     }
-    try {
-      if (Date.now() - fs.statSync(LOCK).mtimeMs > LOCK_STALE_MS) {
-        fs.rmdirSync(LOCK);
-        continue;
-      }
-    } catch {
-      continue;
-    }
-    if (Date.now() >= until || waiting().length === 0) return false;
-    await sleep(LOCK_POLL_MS);
+    const tookOver = takeOver();
+    if (Date.now() >= until || waiting().length === 0) return "another flush holds the lock";
+    if (!tookOver) await sleep(LOCK_POLL_MS);
   }
 }
 
+// Removes a stale lock: it is first moved aside under this flusher's own name, which only one taker can
+// do. A lock that turns out to be fresh (taken between the look and the move) is put back, never over a
+// newer one; if that fails, its holder sees the lock is gone and stops. → true when a lock was moved.
+function takeOver() {
+  try {
+    if (Date.now() - fs.lstatSync(LOCK).mtimeMs <= LOCK_STALE_MS) return false;
+  } catch {
+    return false;
+  }
+  const aside = `${LOCK}.${LOCK_TOKEN}`;
+  try {
+    fs.renameSync(LOCK, aside);
+  } catch {
+    return false;
+  }
+  try {
+    const moved = fs.lstatSync(aside);
+    if (Date.now() - moved.mtimeMs <= LOCK_STALE_MS) {
+      if (moved.isDirectory()) fs.renameSync(aside, LOCK);
+      else fs.linkSync(aside, LOCK);
+    }
+  } catch {}
+  try {
+    fs.rmSync(aside, { recursive: true, force: true });
+  } catch {}
+  return true;
+}
+
+// True while the lock is this flusher's; its time is refreshed then, so it never looks stale while held.
+function holdLock() {
+  try {
+    if (fs.readFileSync(LOCK, "utf8") !== LOCK_TOKEN) return false;
+    const now = new Date();
+    fs.utimesSync(LOCK, now, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Removes the lock only when it is this flusher's.
 function unlock() {
   try {
-    fs.rmdirSync(LOCK);
+    if (fs.readFileSync(LOCK, "utf8") === LOCK_TOKEN) fs.unlinkSync(LOCK);
   } catch {}
 }
 
 // Sends the waiting events in name order until none is left, a write fails or RUN_MS have passed.
+// → { out: "sent N, waiting M, rejected R", why: why events still wait, or null }
 async function flush() {
   const cred = credentials();
   let sent = 0;
   let rejected = 0;
-  if (!cred.missing.length && waiting().length && (await lock())) {
+  let why = problem(cred);
+  if (!why && waiting().length) why = await lock();
+  if (why === "") {
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, () => (unlock(), process.exit(1)));
     const ensured = new Set();
     const tried = new Set();
@@ -375,10 +465,16 @@ async function flush() {
         const names = waiting().filter((name) => !tried.has(name));
         if (!names.length) break;
         for (const name of names) {
-          if (Date.now() >= deadline) break run;
+          if (Date.now() >= deadline) {
+            why = `this run used its ${RUN_MS / 1000} s`;
+            break run;
+          }
           tried.add(name);
           const r = await sendEvent(cred, name, ensured);
-          if (r === "stop") break run;
+          if (r.stop) {
+            why = `${r.stop} (${name})`;
+            break run;
+          }
           if (r === "sent") sent++;
           if (r === "rejected") rejected++;
         }
@@ -387,12 +483,13 @@ async function flush() {
       unlock();
     }
   }
-  return `sent ${sent}, waiting ${waiting().length}, rejected ${rejected}`;
+  const left = waiting().length;
+  return { out: `sent ${sent}, waiting ${left}, rejected ${rejected}`, why: left ? why : null };
 }
 
-// Starts `flush` detached, unless a key is missing. Never throws.
+// Starts `flush` detached, unless the keys are missing or the URL is not safe. Never throws.
 function flushInBackground() {
-  if (credentials().missing.length) return false;
+  if (problem(credentials())) return false;
   try {
     const child = spawn(process.execPath, [__filename, "flush"], {
       cwd: DIR,
@@ -487,9 +584,8 @@ async function hook() {
 }
 
 function status() {
-  const { missing } = credentials();
   return [
-    missing.length ? `supabase: missing ${missing.join(", ")}` : "supabase: set",
+    `supabase: ${problem(credentials()) || "set"}`,
     `waiting: ${waiting().length}`,
     `rejected: ${listEvents(REJECTED).length}`,
     "",
@@ -503,8 +599,10 @@ async function main([cmd]) {
         await hook();
       } catch {}
       return { code: 0 };
-    case "flush":
-      return { code: 0, out: `${await flush()}\n` };
+    case "flush": {
+      const r = await flush();
+      return { code: 0, out: `${r.out}\n`, err: r.why ? `stopped: ${r.why}\n` : "" };
+    }
     case "status":
       return { code: 0, out: status() };
     case "-h":

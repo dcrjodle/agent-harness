@@ -24,7 +24,7 @@ Decisions ask Jev only with a TypeSafe AI key: add `TYPESAFE_API_KEY=<key>` to `
 ## Use
 - `/solve [level] <task>` solves a change end to end; its level sets the stages. Defaults: **small** (the session implements, tests and ships itself; a UI change gets one verifier, whose screenshots the session judges), **medium** (the session implements; a tester and the reviewer check it, and for a UI change the verifier and the designer), **large** (plan → parallel lanes in forks → test ∥ verify → design check ∥ review → fix → PR; the session orchestrates and never reads source). Jev picks the level unless the task's first word names one (`inline` = small, `loop` = large).
 - `/plan` `/test` `/verify` `/review` `/ship` `/search` run one stage. `/verify` runs the verifier and, when checks name a design reference, the designer. `/recipe` saves what a session learned. `/cleanup` removes merged worktrees.
-- `bin/session-log status` shows whether the session log can write to Supabase and how many events wait.
+- `bin/session-log status` shows whether the session log's Supabase keys are set and how many events wait.
 - Invocation differs by CLI: Claude Code uses `/solve ...` (slash command). Codex invokes the same file as a prompt, e.g. `$solve ...` (no `/`, and `$ARGUMENTS` is not expanded — the skill text stands on its own without it). Cursor runs it as a linked command from `.cursor/commands/` after `./setup.sh --project <path>`.
 
 ## Settings
@@ -86,9 +86,9 @@ COCKPIT_SUPABASE_URL=<project URL>
 COCKPIT_SUPABASE_SECRET_KEY=<secret key>
 ```
 
-The secret key bypasses row level security, so it stays in that file: never in a cloud routine, a page or a commit. Cockpit's migration creates the tables (`bin/cockpit supabase migration` prints it).
+The secret key bypasses row level security, so it stays in that file: never in a cloud routine, a page or a commit. It is only sent over `https` (plain `http` only to a loopback host, for tests). Cockpit's migration creates the tables (`bin/cockpit supabase migration` prints it).
 
-It never blocks work. Each event is first a file in `logs/session-outbox/`. One flusher at a time sends them in order, with a short timeout, and deletes each once written. A failed write keeps that event and every later one for the next flush, and an event Supabase refuses moves to `logs/session-outbox/rejected/` with the reason. Without the two keys, events wait (at most 10,000). `bin/session-log status` says whether the keys are set and how many events wait or were rejected; `bin/session-log flush` sends them now.
+It never blocks work. Each event is first a file in `logs/session-outbox/`. One flusher at a time sends them in order, with a short timeout, and deletes each once written. A failed write keeps that event and every later one for the next flush, and an event Supabase refuses moves to `logs/session-outbox/rejected/` with the reason (the newest 1,000 are kept). Without the two keys, or with a URL that is not `https`, events wait (at most 10,000). `bin/session-log status` says whether the keys are set and how many events wait or were rejected; `bin/session-log flush` sends them now and, when some still wait, says why on stderr.
 
 ## Layout
 | Path | What |
