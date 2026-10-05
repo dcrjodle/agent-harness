@@ -80,7 +80,8 @@ esac
 # outside quotes, # comments left out. Quoted text stays in its word (quotes removed, blanks as \037), so
 # messages and docs are data; a `sh -c` or eval string is code. A heredoc body is data, except the $( )
 # and backtick spans of an unquoted one, and all of one fed to a shell; the lines of one fed to another
-# interpreter that name a .env, Jev or Supabase come out marked \035. Text after a closing ), backtick or
+# interpreter that name a .env, Jev or Supabase come out marked \035. Fed to: the heredoc's own command, or
+# a later stage of its pipeline on the same line (cat <<'EOF' | bash). Text after a closing ), backtick or
 # -c string continues a command, not at command position (marked \036), unless the $( or backtick sat in
 # the command's leading words (an assignment, a wrapper or the command word): then the command goes on,
 # the substitution read as $_. One awk pass over the lines (bash 3.2 string handling is quadratic on long
@@ -100,8 +101,14 @@ BEGIN {
   KEEP = "[.]env|--env-file|cd|source|[.][ \t]|bin/decide|bin/session-log|export"
   JEV = "typesafe|systemone|supabase|rest/v1"
 }
-# A segment no rule below can read (it names none of their words) is left out.
-function push() { if (seg != "" && seg != CT && (seg ~ KEEP || tolower(seg) ~ JEV)) print seg; seg = "" }
+# A segment no rule below can read (it names none of their words) is left out. The first one after a |
+# in the pipeline of a heredoc (hp) is fed the heredoc too: a shell makes its body code, an interpreter reads it.
+function push() {
+  if (hp && seg ~ /[^ \t]/) { hp = 0; if (seg ~ SHELL) hm = 2; else if (seg ~ INTERP) hi = 1 }
+  if (seg != "" && seg != CT && (seg ~ KEEP || tolower(seg) ~ JEV)) print seg; seg = ""
+}
+# After a heredoc on this line (hl), a | (or |&) feeds it to the next stage; ; && || end its pipeline.
+function pipe(c) { if (c == ";" || (c == "&" || c == "|") && rest == "" && lead(i) == c) hl = hp = 0; else if (c == "|") hp = 1 }
 function cstart(s, at) { # where a # comment starts in code text s (at: s starts a word), else 0
   if (at && substr(s, 1, 1) == "#") return 1
   return match(s, /[ \t]#/) ? RSTART + 1 : 0
@@ -149,7 +156,7 @@ function heredoc(  r, w, k, d, quoted) { # "<" then P[i] starts with "<": a here
   }
   else { seg = seg "<<"; rest = r; i++; return }
   # The body: 0 data, 1 data but for its $( ) and backtick spans (unquoted), 2 code (fed to a shell).
-  sub(/^-?[ \t]*/, "", w); hd = w; hm = seg ~ SHELL ? 2 : quoted ? 0 : 1; hi = seg ~ INTERP; seg = seg "<<" w
+  sub(/^-?[ \t]*/, "", w); hd = w; hm = seg ~ SHELL ? 2 : quoted ? 0 : 1; hi = seg ~ INTERP; hl = 1; seg = seg "<<" w
 }
 {
   if (body != "") { # a heredoc body, up to its delimiter line
@@ -192,7 +199,7 @@ function heredoc(  r, w, k, d, quoted) { # "<" then P[i] starts with "<": a here
       push(); b = 1
       if (stack != "") { d = length(stack); q = substr(stack, 1, 1) + 0; stack = substr(stack, 2); seg = sv[d] != "" ? sv[d] : CT; if (sk[d] == "$") b = 0; sv[d] = sk[d] = "" }
     }
-    else { if (c == "(") { stack = "0" stack; sv[length(stack)] = ""; sk[length(stack)] = "(" } push(); b = 1 }
+    else { if (c == "(") { stack = "0" stack; sv[length(stack)] = ""; sk[length(stack)] = "(" } push(); b = 1; if (hl) pipe(c) }
     if (rest == "") { if (b >= 0) wb = b; continue }
     if (q == 0 && index(rest, "#") && (k = cstart(rest, b >= 0 ? b : wb))) { # a comment starts in this text
       data(substr(rest, 1, k - 1)); cmt = 1; cend = cq != "" ? cq : bt != "" ? "`" : ""; continue
@@ -204,7 +211,7 @@ function heredoc(  r, w, k, d, quoted) { # "<" then P[i] starts with "<": a here
   else if (q) seg = seg US
   else {
     push()
-    if (hd != "") { body = hd; bm = hm; bi = hi; hd = ""; bj = 0; split("", ES); if (bm) { bstack = stack; stack = ""; q = bm == 1 ? 3 : 0 } }
+    if (hd != "") { body = hd; bm = hm; bi = hi; hd = ""; hl = hp = 0; bj = 0; split("", ES); if (bm) { bstack = stack; stack = ""; q = bm == 1 ? 3 : 0 } }
   }
 }
 END { push() }
