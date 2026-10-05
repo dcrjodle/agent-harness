@@ -66,6 +66,55 @@ while IFS= read -r seg; do
   deny "don't read .env files; pass secrets by reference (source / --env-file)."
 done <<< "$(printf '%s\n' "$cmd" | tr ';&|' '\n\n\n')"
 
+# bin/decide is the harness's only Jev client; its decisions run at solve's fixed steps, from the
+# orchestrator. An invocation is a token ending in bin/decide at command position: a segment's start,
+# after VAR=val words, env/exec/time and the like, or node and its options. Heredoc bodies are data.
+nl='
+'
+q="[\"']"
+var_re="[A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]\"']*)"
+decide_re="^[[:space:](!{]*((${var_re}|env|exec|command|time|nohup|if|then|do|else|elif|while|until)[[:space:]]+)*(node([[:space:]]+-[^[:space:]]*)*[[:space:]]+)?${q}?[^[:space:]\"'\`]*bin/decide${q}?([[:space:]]|\$)"
+heredoc_re="(^|[^<])<<-?[[:space:]]*${q}?([A-Za-z_][A-Za-z0-9_]*)"
+export_re='^[[:space:]]*export[[:space:]]'
+scratch_re='(^|[[:space:]])HARNESS_DIR=[^[:space:]]'
+loopback_re="(^|[[:space:]])TYPESAFE_BASE_URL=${q}?https?://(localhost|127\.[0-9.]+|\[::1\])([:/\"'[:space:]]|\$)"
+hd="" points="" exports="" rest=""
+while IFS= read -r seg; do
+  if [ -n "$hd" ]; then
+    rest="$rest$nl$seg"
+    [ "${seg//[[:space:]]/}" = "$hd" ] && hd=""
+    continue
+  fi
+  [[ $seg =~ $heredoc_re ]] && hd="${BASH_REMATCH[2]}"
+  if [[ $seg =~ $decide_re ]]; then
+    pre="${BASH_REMATCH[0]}"
+    read -r sub _ <<< "${seg:${#pre}}"
+    sub="${sub//[\"\']/}"
+    case "$sub" in
+      level|recipe|ui|start) points="$points$nl$pre" ;;
+      ""|stages|check|-h|--help) ;;
+      *) deny "unknown decision point '$sub' for bin/decide: use level, recipe, ui or start (stages and check need no Jev)." ;;
+    esac
+  else
+    rest="$rest$nl$seg"
+    [[ $seg =~ $export_re ]] && exports="$exports $seg"
+  fi
+done <<< "$(printf '%s\n' "${cmd//\$(/$nl}" | tr ';&|' '\n\n\n')"
+
+# A sub-agent decides only against a scratch harness and a local fake Jev (tests), set for decide itself.
+if [ -n "$agent" ] && [ -n "$points" ]; then
+  while IFS= read -r pre; do
+    [ -n "$pre" ] || continue
+    [[ "$pre $exports" =~ $scratch_re && "$pre $exports" =~ $loopback_re ]] \
+      || deny "bin/decide decisions are the orchestrator's, at solve's fixed steps. Sub-agents may run bin/decide stages and check; tests may decide against a scratch HARNESS_DIR with a loopback TYPESAFE_BASE_URL."
+  done <<< "$points"
+fi
+
+# The harness key is for bin/decide only; a project's own Jev use (its own key and .env) is not touched.
+if printf '%s' "$rest" | grep -Eq '\.agent-harness/\.env([^.[:alnum:]_-]|$)' && printf '%s' "$rest" | grep -Eqi 'typesafe|systemone'; then
+  deny "the harness .env's TYPESAFE_API_KEY is only for bin/decide; a project calls Jev with its own key."
+fi
+
 # Global git options before the subcommand, e.g. `--no-pager`, `-c k=v`, `-C <path>`.
 git_opts='(-C[[:space:]]+[^[:space:]]+|-c[[:space:]]+[^[:space:]]+|--no-pager|--paginate|--git-dir=[^[:space:]]+|--work-tree=[^[:space:]]+|--)'
 git_re="(^|[;&|[:space:]])git([[:space:]]+${git_opts})*[[:space:]]+(push|commit)([[:space:]]|\$)"
