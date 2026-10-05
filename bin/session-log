@@ -185,11 +185,12 @@ function queue(events) {
     } catch {}
   }
   // A writer killed between its write and its rename leaves its dot-file behind, a flusher killed while
-  // taking a stale lock over leaves the lock it moved aside.
+  // taking a stale lock over leaves the lock it moved aside: a file, or a folder (the earlier version's
+  // lock), removed as takeOver removes it (a symlink itself, never what it points to).
   for (const name of entries.filter((entry) => STRAY_FILE.test(entry))) {
     const file = path.join(OUTBOX, name);
     try {
-      if (Date.now() - fs.lstatSync(file).mtimeMs > STRAY_STALE_MS) fs.unlinkSync(file);
+      if (Date.now() - fs.lstatSync(file).mtimeMs > STRAY_STALE_MS) fs.rmSync(file, { recursive: true, force: true });
     } catch {}
   }
   return queued;
