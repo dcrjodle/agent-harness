@@ -5,7 +5,7 @@ argument-hint: "[previous review file]"
 ---
 Spawn the `reviewer` role (`~/.agent-harness/agents/reviewer.md`) on the current task worktree. $ARGUMENTS
 
-- No previous file → round 1 on the role's large model, writes `<handoff>/review-1.md`.
-- Previous file given → next round on medium: override the model to sonnet when launching, writes the next `review-N.md`.
+- No previous file → round 1, writes `<handoff>/review-1.md`.
+- Previous file given → the next round, which only confirms its items, writes the next `review-N.md`.
 
-Relay severity counts; the findings stay in the file.
+Every round runs on the model in the role file. Relay severity counts; the findings stay in the file.
