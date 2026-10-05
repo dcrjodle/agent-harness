@@ -2,6 +2,7 @@
 source "$(dirname "$0")/../bin/_lib.sh"
 input="$(cat)"
 command -v jq >/dev/null || exit 0
+LC_ALL=C # bytewise string handling in this script; bash 3.2 is much slower on long text in a UTF-8 locale
 
 deny() { echo "harness guard: $1" >&2; exit 2; }
 
@@ -59,60 +60,180 @@ cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty | if type == "
 
 # .env reads via shell readers/searchers: match the path token independently of
 # what precedes it (flags, other args), excluding .env.example/.sample/.template.
-while IFS= read -r seg; do
-  printf '%s' "$seg" | grep -Eq '(^|[[:space:]])(cat|less|more|head|tail|bat|strings|base64|xxd|od|grep|egrep|fgrep|sed|awk|jq)([[:space:]]|$)' || continue
-  printf '%s' "$seg" | grep -Eq '(^|[/"'\''[:space:]=])\.env(\.[a-zA-Z_]+)?(["'\''[:space:]]|$)' || continue
-  printf '%s' "$seg" | grep -Eq '\.env\.(example|sample|template)(["'\''[:space:]]|$)' && continue
-  deny "don't read .env files; pass secrets by reference (source / --env-file)."
-done <<< "$(printf '%s\n' "$cmd" | tr ';&|' '\n\n\n')"
+reader_re='(^|[[:space:]])(cat|less|more|head|tail|bat|strings|base64|xxd|od|grep|egrep|fgrep|sed|awk|jq)([[:space:]]|$)'
+env_token_re='(^|[/"'\''[:space:]=])\.env(\.[a-zA-Z_]+)?(["'\''[:space:]]|$)'
+env_example_re='\.env\.(example|sample|template)(["'\''[:space:]]|$)'
+case "$cmd" in *.env*)
+  while IFS= read -r seg; do
+    case "$seg" in *.env*) ;; *) continue ;; esac
+    case "$seg" in *cat*|*less*|*more*|*head*|*tail*|*bat*|*strings*|*base64*|*xxd*|*od*|*grep*|*sed*|*awk*|*jq*) ;; *) continue ;; esac
+    [[ $seg =~ $reader_re ]] || continue
+    [[ $seg =~ $env_token_re ]] || continue
+    [[ $seg =~ $env_example_re ]] && continue
+    deny "don't read .env files; pass secrets by reference (source / --env-file)."
+  done <<< "$(printf '%s\n' "$cmd" | tr ';&|' '\n\n\n')"
+esac
 
-# bin/decide is the harness's only Jev client; its decisions run at solve's fixed steps, from the
-# orchestrator. An invocation is a token ending in bin/decide at command position: a segment's start,
-# after VAR=val words, env/exec/time and the like, or node and its options. Heredoc bodies are data.
-nl='
+# bin/decide is the harness's only Jev client and bin/session-log the only writer of the session log;
+# both act for the orchestrator, and the harness .env's keys are for these two alone. The rules below
+# read the command roughly as a shell does: code segments split at ; & | ( ) newlines, $( and backticks
+# outside quotes. Quoted text stays in its word (quotes removed, blanks as \037) and heredoc bodies are
+# dropped, so messages and docs are data; a `sh -c` or eval string is code. Text after a closing ),
+# backtick or -c string continues a command, not at command position (marked \036). One awk pass over
+# the lines (bash 3.2 string handling is quadratic on long text); only commands naming bin/decide,
+# bin/session-log or a .env are read.
+split_awk='
+BEGIN {
+  US = "\037"; CT = "\036"; M = "\034"; q = 0
+  SHC = "(^|[ \t/])((ba|da|z|k)?sh([ \t]+-[A-Za-z]+)*[ \t]+-[A-Za-z]*c|eval)[ \t]*$"
+}
+function push() { if (seg != "" && seg != CT) print seg; seg = "" }
+function data(s) { if (q) gsub(/[ \t]/, US, s); seg = seg s }
+function lit(c) { seg = seg (c == " " || c == "\t" ? US : c) }
+function lead(k) { return k <= n ? substr(P[k], 1, 1) : "" }
+function heredoc(  r, w, k, d) { # "<" then P[i] starts with "<": a here-string, a heredoc or "<<"
+  r = substr(P[i], 2)
+  if (r == "" && lead(i + 1) == "<") { seg = seg "<<<"; rest = substr(P[i + 1], 2); i += 2; return }
+  if (match(r, /^-?[ \t]*[A-Za-z_][A-Za-z0-9_]*/)) { w = substr(r, 1, RLENGTH); rest = substr(r, RLENGTH + 1); i++ }
+  else if (r ~ /^-?[ \t]*$/ && (d = lead(i + 1)) != "" && index("\\\"" SQ, d)) { # an escaped or quoted word
+    k = i + 1; w = substr(P[k], 2)
+    if (d == "\\" && match(w, /^[A-Za-z_][A-Za-z0-9_]*/)) { rest = substr(w, RLENGTH + 1); w = substr(w, 1, RLENGTH); i = k + 1 }
+    else if (d != "\\" && w ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && lead(k + 1) == d) { rest = substr(P[k + 1], 2); i = k + 2 }
+    else { seg = seg "<<"; rest = r; i++; return }
+  }
+  else { seg = seg "<<"; rest = r; i++; return }
+  sub(/^-?[ \t]*/, "", w); hd = w; seg = seg "<<" w
+}
+{
+  if (body != "") { t = $0; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t); if (t == body) body = ""; next }
+  line = $0; gsub(/\034/, "", line); gsub(/[;&|()<"`$\\]/, M "&", line); gsub(SQ, M SQ, line)
+  n = split(line, P, M); cont = 0; i = 1
+  while (i <= n) { # q: 0 code, 1 in single quotes, 2 in double quotes; stack: the q each $( and ( returns to
+    c = i == 1 ? "" : substr(P[i], 1, 1); rest = i == 1 ? P[i] : substr(P[i], 2); i++
+    if (esc) { esc = 0; lit(c); c = "" }
+    if (c == "") ;
+    else if (q == 1) { if (c == SQ) q = 0; else data(c) }
+    else if (c == "\\") { if (rest != "") { lit(substr(rest, 1, 1)); rest = substr(rest, 2) } else if (i <= n) esc = 1; else cont = 1 }
+    else if (c == "$") { if (rest == "" && lead(i) == "(") { stack = q stack; q = 0; push(); rest = substr(P[i], 2); i++ } else data(c) }
+    else if (c == "`") { push(); if (bt == "") { bt = q ""; q = 0 } else { q = bt + 0; bt = ""; seg = CT } }
+    else if (q == 2) { if (c == "\"") q = 0; else data(c) }
+    else if (c == SQ || c == "\"") { if (c == cq) { cq = ""; push(); seg = CT } else if (cq == "" && seg ~ SHC) { cq = c; push() } else q = c == SQ ? 1 : 2 }
+    else if (c == "<") { if (rest == "" && lead(i) == "<") heredoc(); else data(c) }
+    else if (c == ")") { push(); if (stack != "") { q = substr(stack, 1, 1) + 0; stack = substr(stack, 2); seg = CT } }
+    else { if (c == "(") stack = "0" stack; push() }
+    if (rest != "") data(rest)
+  }
+  if (cont) seg = seg (q ? US : " ")
+  else if (q) seg = seg US
+  else { push(); if (hd != "") { body = hd; hd = "" } }
+}
+END { push() }
 '
-q="[\"']"
-var_re="[A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]\"']*)"
-decide_re="^[[:space:](!{]*((${var_re}|env|exec|command|time|nohup|if|then|do|else|elif|while|until)[[:space:]]+)*(node([[:space:]]+-[^[:space:]]*)*[[:space:]]+)?${q}?[^[:space:]\"'\`]*bin/decide${q}?([[:space:]]|\$)"
-heredoc_re="(^|[^<])<<-?[[:space:]]*${q}?([A-Za-z_][A-Za-z0-9_]*)"
-export_re='^[[:space:]]*export[[:space:]]'
-scratch_re='(^|[[:space:]])HARNESS_DIR=[^[:space:]]'
-loopback_re="(^|[[:space:]])TYPESAFE_BASE_URL=${q}?https?://(localhost|127\.[0-9.]+|\[::1\])([:/\"'[:space:]]|\$)"
-hd="" points="" exports="" rest=""
-while IFS= read -r seg; do
-  if [ -n "$hd" ]; then
-    rest="$rest$nl$seg"
-    [ "${seg//[[:space:]]/}" = "$hd" ] && hd=""
-    continue
-  fi
-  [[ $seg =~ $heredoc_re ]] && hd="${BASH_REMATCH[2]}"
-  if [[ $seg =~ $decide_re ]]; then
-    pre="${BASH_REMATCH[0]}"
-    read -r sub _ <<< "${seg:${#pre}}"
-    sub="${sub//[\"\']/}"
-    case "$sub" in
-      level|recipe|ui|start) points="$points$nl$pre" ;;
-      ""|stages|check|-h|--help) ;;
-      *) deny "unknown decision point '$sub' for bin/decide: use level, recipe, ui or start (stages and check need no Jev)." ;;
-    esac
-  else
-    rest="$rest$nl$seg"
-    [[ $seg =~ $export_re ]] && exports="$exports $seg"
-  fi
-done <<< "$(printf '%s\n' "${cmd//\$(/$nl}" | tr ';&|' '\n\n\n')"
+code_segments() { # $1 command → segs
+  local out IFS=$'\n'
+  out="$(printf '%s\n' "$1" | LC_ALL=C awk -v SQ="'" "$split_awk" 2>/dev/null)"
+  set -f; segs=($out); set +f
+}
 
-# A sub-agent decides only against a scratch harness and a local fake Jev (tests), set for decide itself.
+# The live harness: the repo this hook runs from, and ~/.agent-harness; symlinks resolved.
+here="" home_harness=""
+live_dir() { # $1 dir → 0 when it is the live harness, or relative or a variable the guard can't resolve
+  local d=$1 r
+  case $d in "~"|"~/"*) d=$HOME${d#\~} ;; '$HOME'|'$HOME/'*) d=$HOME${d#\$HOME} ;; '${HOME}'|'${HOME}/'*) d=$HOME${d#\$\{HOME\}} ;; esac
+  case $d in *'$'*) return 0 ;; /*) ;; *) return 0 ;; esac
+  [ -n "$here" ] || here="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd -P)" home_harness="$(cd "$HOME/.agent-harness" 2>/dev/null && pwd -P)"
+  r="$(cd "$d" 2>/dev/null && pwd -P)" || r=${d%/}
+  [ "$r" = "$here" ] || [ "$r" = "${home_harness:-$HOME/.agent-harness}" ] || [ "${d%/}" = "$HOME/.agent-harness" ]
+}
+scratch_dir() { # $1 a HARNESS_DIR value → 0 when it is an absolute path to a scratch harness
+  case $1 in ""|*/.|*/./*|*/..|*/../*) return 1 ;; esac
+  ! live_dir "$1"
+}
+harness_env() { # $1 a path as written, $2 the dir it is relative to → 0 when it is the live harness's .env
+  local p=${1//$us/ } d
+  case $p in /*|"~"*|'$HOME'*|'${HOME}'*) ;; *) p=$2/$p ;; esac
+  case $p in "~/"*) p=$HOME${p#\~} ;; '$HOME/'*) p=$HOME${p#\$HOME} ;; '${HOME}/'*) p=$HOME${p#\$\{HOME\}} ;; esac
+  [ "${p##*/}" = .env ] || return 1
+  case $p in */.agent-harness/.env) return 0 ;; *'$'*) return 1 ;; /*) ;; *) return 1 ;; esac
+  d=${p%/*}
+  live_dir "${d:-/}"
+}
+
+nl=$'\n' us=$'\037' rs=$'\036'
+var_re="[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*"
+wrap_re="([^[:space:]]*/)?(env|exec|command|builtin|time|nohup|sudo|doas|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)([[:space:]]+(-[^[:space:]]*|[0-9][^[:space:]]*))*"
+lead_re="^[[:space:](!{]*((${var_re}|${wrap_re}|if|then|do|else|elif|while|until)[[:space:]]+)*(node([[:space:]]+-[^[:space:]]*)*[[:space:]]+)?[^[:space:]]*"
+decide_re="${lead_re}bin/decide([[:space:]]|\$)"
+log_re="${lead_re}bin/session-log([[:space:]]|\$)"
+source_re="^[[:space:](!{]*((${var_re}|${wrap_re}|if|then|do|else|elif|while|until)[[:space:]]+)*(source|\\.)[[:space:]]+([^[:space:]]+)"
+envfile_re="(^|[[:space:]])--env-file(-if-exists)?(=|[[:space:]]+)([^[:space:]]+)(.*)"
+cd_re="^[[:space:](!{]*cd[[:space:]]+([^[:space:]]+)"
+export_re='^[[:space:]]*export[[:space:]]'
+url_re='.*[[:space:]]TYPESAFE_BASE_URL=([^[:space:]]*)'
+dir_re='.*[[:space:]]HARNESS_DIR=([^[:space:]]*)'
+loopback_re='^https?://(localhost|127\.[0-9.]+|\[::1\])([:/]|$)'
+segs=() points="" logs="" exports="" loads="" wd="$cwd"
+case "$cmd" in *bin/decide*|*bin/session-log*|*.env*) code_segments "$cmd" ;; esac
+for seg in "${segs[@]}"; do
+  case $seg in *--env-file*)
+    rest=${seg#"$rs"}
+    while [[ $rest =~ $envfile_re ]]; do
+      harness_env "${BASH_REMATCH[4]}" "$wd" && loads=1
+      rest=${BASH_REMATCH[5]}
+    done ;;
+  esac
+  case $seg in "$rs"*) continue ;; *cd*|*source*|*.[[:space:]]*|*bin/decide*|*bin/session-log*|*export*) ;; *) continue ;; esac
+  if [[ $seg =~ $cd_re ]]; then
+    case ${BASH_REMATCH[1]} in /*|"~"*|'$HOME'*|'${HOME}'*) wd=${BASH_REMATCH[1]} ;; *) wd=$wd/${BASH_REMATCH[1]} ;; esac
+  fi
+  [[ $seg =~ $source_re ]] && harness_env "${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}" "$wd" && loads=1
+  if [[ $seg =~ $decide_re ]]; then
+    pre=${BASH_REMATCH[0]}
+    read -r sub _ <<< "${seg:${#pre}}"
+    case "$sub" in
+      level|recipe|ui|start) points="$points$nl $exports $pre" ;;
+      ""|stages|check|-h|--help) ;;
+      *) deny "unknown decision point '${sub//$us/ }' for bin/decide: use level, recipe, ui or start (stages and check need no Jev)." ;;
+    esac
+  elif [[ $seg =~ $log_re ]]; then
+    pre=${BASH_REMATCH[0]}
+    read -r sub _ <<< "${seg:${#pre}}"
+    case "$sub" in ""|-h|--help) ;; *) logs="$logs$nl $exports $pre" ;; esac
+  elif [[ $seg =~ $export_re ]]; then
+    exports="$exports $seg"
+  fi
+done
+
+# A sub-agent decides only in tests: against a scratch harness (an absolute HARNESS_DIR that is not the
+# live harness) and a loopback TYPESAFE_BASE_URL, both set for decide itself (on its command or exported
+# before it). It runs bin/session-log only against a scratch harness, too.
 if [ -n "$agent" ] && [ -n "$points" ]; then
   while IFS= read -r pre; do
     [ -n "$pre" ] || continue
-    [[ "$pre $exports" =~ $scratch_re && "$pre $exports" =~ $loopback_re ]] \
+    jev_url="" hdir=""
+    [[ $pre =~ $url_re ]] && jev_url=${BASH_REMATCH[1]}
+    [[ $pre =~ $dir_re ]] && hdir=${BASH_REMATCH[1]//$us/ }
+    [ -n "$hdir" ] && [[ $jev_url =~ $loopback_re ]] \
       || deny "bin/decide decisions are the orchestrator's, at solve's fixed steps. Sub-agents may run bin/decide stages and check; tests may decide against a scratch HARNESS_DIR with a loopback TYPESAFE_BASE_URL."
+    scratch_dir "$hdir" \
+      || deny "a sub-agent's HARNESS_DIR must be an absolute path to a scratch harness, never the live one (~/.agent-harness or this harness)."
   done <<< "$points"
 fi
+if [ -n "$agent" ] && [ -n "$logs" ]; then
+  while IFS= read -r pre; do
+    [ -n "$pre" ] || continue
+    hdir=""
+    [[ $pre =~ $dir_re ]] && hdir=${BASH_REMATCH[1]//$us/ }
+    scratch_dir "$hdir" \
+      || deny "bin/session-log writes the orchestrator's session log; a sub-agent runs it only against a scratch HARNESS_DIR, an absolute path that is not the live harness (--help is free)."
+  done <<< "$logs"
+fi
 
-# The harness key is for bin/decide only; a project's own Jev use (its own key and .env) is not touched.
-if printf '%s' "$rest" | grep -Eq '\.agent-harness/\.env([^.[:alnum:]_-]|$)' && printf '%s' "$rest" | grep -Eqi 'typesafe|systemone'; then
-  deny "the harness .env's TYPESAFE_API_KEY is only for bin/decide; a project calls Jev with its own key."
+# The harness .env's keys (Jev, Supabase) are only for bin/decide and bin/session-log: a command that
+# loads it (source, . or --env-file, also relative to a cd into it) and names Jev or Supabase in its code
+# is denied. A project's own Jev or Supabase use, with its own .env, is not touched.
+if [ -n "$loads" ] && printf '%s\n' "${segs[@]}" | grep -Eqi 'typesafe|systemone|supabase|rest/v1'; then
+  deny "the harness .env's keys are only for bin/decide and bin/session-log; a project calls Jev or Supabase with its own keys."
 fi
 
 # Global git options before the subcommand, e.g. `--no-pager`, `-c k=v`, `-C <path>`.
