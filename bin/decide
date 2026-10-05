@@ -2,7 +2,8 @@
 // decide: the harness's only Jev client (TypeSafe AI, POST /v1/systemone), for three fixed
 // decision points: level and recipe at the start of a solve, ui after implementation.
 // Fixed wording and a pinned model from settings.json, argmax with fixed thresholds and fixed
-// fallbacks, cached answers in logs/decisions/, every decision appended to logs/decisions.jsonl.
+// fallbacks, cached answers in logs/decisions/. `start` and `ui` queue their decisions (and start
+// the session) for the session log, bin/session-log, when they know the Claude Code session.
 // Never blocks work: every decision exits 0, fallbacks included; usage and settings errors exit 2.
 // Dir: $HARNESS_DIR or this script's repo. Key: TYPESAFE_API_KEY from <dir>/.env only.
 // A task of issue numbers only is decided on the issues' titles and first body lines (gh, in the repo).
@@ -17,11 +18,15 @@ const { execFileSync, spawn } = require("node:child_process");
 const USAGE = `usage:
   decide level  [--repo DIR] [--json] [--] TASK...  pick the level for a task
   decide recipe [--repo DIR] [--json] [--] TASK...  pick one of the repo's cached recipes, or none
-  decide ui     [--base REV] [--json] WORKTREE      did the task change a UI (base: <WORKTREE>.handoff/base)
-  decide start  [--repo DIR] [--json] [--] TASK...  level, then recipe when the repo has recipes
+  decide ui     [--base REV] [--session ID] [--json] WORKTREE
+                                                    did the task change a UI (base: <WORKTREE>.handoff/base)
+  decide start  [--repo DIR] [--session ID] [--json] [--] TASK...
+                                                    level, then recipe when the repo has recipes
   decide stages [--json] LEVEL                      a level's stages, without Jev
   decide check  [FILE]                              validate settings.json
 A TASK of issue numbers only ("41 42") is read with gh issue view in the repo.
+start and ui log the session and their decisions for the Claude Code session --session names, else
+CLAUDE_CODE_SESSION_ID; without one they log nothing.
 `;
 
 const SCRIPT_ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
@@ -48,11 +53,6 @@ const usage = (msg) => {
 };
 const fail = (msg) => {
   throw new Exit(2, "", `decide: ${msg}\n`);
-};
-const warn = (msg) => {
-  try {
-    fs.writeSync(2, `decide: ${msg}\n`);
-  } catch {}
 };
 
 // ---------- settings and their schema ----------
@@ -506,8 +506,9 @@ async function attemptJev(url, apiKey, payload, deadline) {
 
 // ---------- output ----------
 
-function logLine(d) {
-  return JSON.stringify({
+// A decision as --json prints it.
+function record(d) {
+  return {
     v: 1,
     time: new Date().toISOString(),
     point: d.point,
@@ -520,25 +521,26 @@ function logLine(d) {
     inputHash: d.inputHash,
     repo: d.repo,
     ms: d.ms,
-  });
-}
-
-function appendLog(d) {
-  const line = logLine(d);
-  try {
-    fs.mkdirSync(LOGS, { recursive: true });
-    fs.appendFileSync(path.join(LOGS, "decisions.jsonl"), `${line}\n`);
-  } catch (e) {
-    warn(`could not append to ${path.join(LOGS, "decisions.jsonl")} (${e.code || e.message})`);
-  }
-  return line;
+  };
 }
 
 const tag = (d) => `${d.source}, ${d.source === "jev" || d.source === "cache" ? d.confidence.toFixed(2) : d.reason}`;
 
 function emit(d, json) {
-  const line = appendLog(d);
-  return { code: 0, out: json ? `${line}\n` : `${d.point}: ${d.value} (${tag(d)})\n` };
+  return { code: 0, out: json ? `${JSON.stringify(record(d))}\n` : `${d.point}: ${d.value} (${tag(d)})\n` };
+}
+
+const decisionEvent = (d) => ({ kind: "decision", point: d.point, value: d.value, confidence: d.confidence, source: d.source });
+
+// Queues events of the Claude Code session (--session, else CLAUDE_CODE_SESSION_ID) for the session log
+// and starts a background flush; `dir` names the repo. Without a session, nothing. Never throws.
+function logSession(session, dir, events) {
+  const id = session || process.env.CLAUDE_CODE_SESSION_ID || "";
+  if (!id) return;
+  try {
+    const log = require(path.join(path.dirname(fs.realpathSync(__filename)), "session-log"));
+    if (log.queue(events.map((e) => ({ ...e, session_id: id, dir })))) log.flushInBackground();
+  } catch {}
 }
 
 // ---------- commands ----------
@@ -569,7 +571,7 @@ function parseOptions(args, valued, flags, anywhere = false) {
 }
 
 async function taskCommand(cmd, args) {
-  const { opts, rest } = parseOptions(args, ["--repo"], ["--json"]);
+  const { opts, rest } = parseOptions(args, cmd === "start" ? ["--repo", "--session"] : ["--repo"], ["--json"]);
   if (!normalize(rest.join(" "))) usage(`${cmd}: no task`);
   const settings = loadSettings();
   const task = parseTask(rest, settings.levels);
@@ -592,14 +594,17 @@ async function taskCommand(cmd, args) {
     runPoint(settings, levelSpec(settings, task, issues), repo),
     recipes.length ? runPoint(settings, recipeSpec(settings, task, recipes, issues), repo) : null,
   ]);
-  const lvLine = appendLog(lv);
-  const rcLine = rc ? appendLog(rc) : null;
   const stages = stagesOf(settings.levels.find((l) => l.id === lv.value));
+  logSession(opts.session, repoDir, [
+    { kind: "session", title: task.rest || null, level: lv.value },
+    decisionEvent(lv),
+    ...(rc ? [decisionEvent(rc)] : []),
+  ]);
   if (opts.json) {
-    return { code: 0, out: `${JSON.stringify({ level: JSON.parse(lvLine), recipe: rcLine && JSON.parse(rcLine), stages })}\n` };
+    return { code: 0, out: `${JSON.stringify({ level: record(lv), recipe: rc && record(rc), stages })}\n` };
   }
   const lines = [
-    "Harness decision for this solve (bin/decide, logged in logs/decisions.jsonl):",
+    "Harness decision for this solve (bin/decide):",
     `- Level: ${lv.value} (${tag(lv)}). Stages: ${stagesText(stages)}.`,
   ];
   if (rc && rc.value === "none") lines.push(`- Recipe: none (${tag(rc)}).`);
@@ -608,7 +613,7 @@ async function taskCommand(cmd, args) {
 }
 
 async function uiCommand(args) {
-  const { opts, rest } = parseOptions(args, ["--base"], ["--json"], true);
+  const { opts, rest } = parseOptions(args, ["--base", "--session"], ["--json"], true);
   if (rest.length !== 1) usage("ui: give one WORKTREE");
   const settings = loadSettings();
   const wt = path.resolve(rest[0]);
@@ -633,7 +638,9 @@ async function uiCommand(args) {
   const paths = diff.split("\0").filter(Boolean).sort().slice(0, MAX_PATHS);
   const commits = log.split("\n").filter(Boolean).slice(0, MAX_COMMITS);
   const state = normalize(["paths:", ...paths, "commits:", ...commits].join("\n"));
-  return emit(await runPoint(settings, uiSpec(settings, state), repoName(wt)), opts.json);
+  const d = await runPoint(settings, uiSpec(settings, state), repoName(wt));
+  logSession(opts.session, wt, [decisionEvent(d)]);
+  return emit(d, opts.json);
 }
 
 function stagesCommand(args) {
