@@ -8,7 +8,8 @@
 //   fake.queue(["500", "ok"]);      // one mode per upcoming request, then the standing mode
 //   fake.requests;                  // every request that arrived (see below)
 //   fake.clear();                   // forget the recorded requests, keep the mode
-//   fake.reset();                   // forget them and go back to `ok`
+//   fake.reset();                   // forget requests and rows and go back to `ok`
+//   fake.rows("cockpit_agents");    // the rows the accepted writes left (see below)
 //   await fake.close();
 //
 // Modes:
@@ -23,7 +24,15 @@
 // Every request is recorded as { method, path, apikey, authorization, prefer, contentType, headers, raw,
 // body, answered }, `path` being the URL with its query and `answered` the status sent (null when the
 // connection was destroyed). A path outside /rest/v1/ answers 404 like PostgREST does.
+//
+// The accepted writes also build the three tables in memory, the way PostgREST would apply them: a POST
+// inserts a row (on a conflict on `on_conflict`, `resolution=ignore-duplicates` keeps the old row and
+// `resolution=merge-duplicates` sets only the columns the body holds) and a PATCH sets its columns on every
+// row its `col=eq.value` filters match, and on none when no row does (still answered 204, as PostgREST
+// does). `matched` on a recorded request says how many rows it hit. Constraints are not checked.
 import http from "node:http";
+
+const PRIMARY = { cockpit_sessions: ["id"], cockpit_agents: ["id"], cockpit_decisions: ["session_id", "point", "at"] };
 
 const ERRORS = {
   400: { code: "23514", message: 'new row for relation "cockpit_agents" violates check constraint "cockpit_agents_role_check"' },
@@ -33,8 +42,35 @@ const ERRORS = {
 export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
   const requests = [];
   const timers = new Set();
+  const tables = new Map();
   let standing = "ok";
   let queued = [];
+
+  function apply(req, entry) {
+    const url = new URL(req.url, "http://fake.invalid");
+    const table = url.pathname.slice("/rest/v1/".length);
+    if (!(table in PRIMARY) || !entry.body || typeof entry.body !== "object" || Array.isArray(entry.body)) return;
+    if (!tables.has(table)) tables.set(table, new Map());
+    const rows = tables.get(table);
+    if (req.method === "POST") {
+      const columns = (url.searchParams.get("on_conflict") || PRIMARY[table].join(",")).split(",");
+      const key = columns.map((column) => String(entry.body[column])).join("\u0000");
+      const existing = rows.get(key);
+      if (!existing) rows.set(key, { ...entry.body });
+      else if ((entry.prefer || "").includes("resolution=merge-duplicates")) Object.assign(existing, entry.body);
+      entry.matched = existing ? 1 : 0;
+    } else if (req.method === "PATCH") {
+      let matched = 0;
+      for (const row of rows.values()) {
+        const filters = [...url.searchParams].filter(([column]) => column !== "on_conflict" && column !== "select");
+        if (filters.every(([column, value]) => value.startsWith("eq.") && String(row[column]) === value.slice(3))) {
+          Object.assign(row, entry.body);
+          matched++;
+        }
+      }
+      entry.matched = matched;
+    }
+  }
 
   const reply = (res, entry, status, text) => {
     entry.answered = status;
@@ -85,8 +121,12 @@ export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
     const name = sep === -1 ? spec : spec.slice(0, sep);
     const arg = sep === -1 ? "" : spec.slice(sep + 1);
     const [okStatus, okBody] = okAnswer(req);
+    const accept = () => {
+      apply(req, entry);
+      reply(res, entry, okStatus, okBody);
+    };
 
-    if (name === "ok") return reply(res, entry, okStatus, okBody);
+    if (name === "ok") return accept();
     if (name === "redirect") {
       entry.answered = 307;
       res.writeHead(307, { location: arg });
@@ -100,7 +140,7 @@ export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
     if (name === "delay") {
       const timer = setTimeout(() => {
         timers.delete(timer);
-        reply(res, entry, okStatus, okBody);
+        accept();
       }, Number(arg));
       timers.add(timer);
       res.on("close", () => {
@@ -112,7 +152,7 @@ export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
     const plain = name.startsWith("plain");
     const status = Number(plain ? name.slice(5) : name);
     if (!Number.isInteger(status) || status < 100) return failure(res, entry, 500, false);
-    if (sep !== -1 && !new RegExp(arg).test(req.url)) return reply(res, entry, okStatus, okBody);
+    if (sep !== -1 && !new RegExp(arg).test(req.url)) return accept();
     return failure(res, entry, status, plain);
   }
 
@@ -142,8 +182,13 @@ export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
     },
     reset() {
       requests.length = 0;
+      tables.clear();
       standing = "ok";
       queued = [];
+    },
+    // The rows of a table, oldest insert first, as copies.
+    rows(table) {
+      return [...(tables.get(table)?.values() ?? [])].map((row) => ({ ...row }));
     },
     async close() {
       for (const timer of timers) clearTimeout(timer);

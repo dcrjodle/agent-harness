@@ -712,6 +712,105 @@ describe("H-A bin/session-log", () => {
     });
   });
 
+  describe("what the tables hold after the flush (the fake applies the writes like PostgREST)", () => {
+    const agentRow = (fake, id) => fake.rows("cockpit_agents").find((row) => row.id === id);
+
+    it("a whole life: the session ended, the agent done and labelled", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      meta("s1", "a1", "Lane 1:   API routes");
+      quiet(await hook(h, start("a1")));
+      quiet(await hook(h, labelled()));
+      quiet(await hook(h, stopped()));
+      quiet(await hook(h, ended()));
+      const [e1, , e3, e4] = h.events();
+      full();
+      assert.equal((await flush(h)).stdout, "sent 4, waiting 0, rejected 0\n");
+      assert.deepEqual(fake.rows("cockpit_sessions"), [{ id: "s1", repo: "o/acme", title: null, level: null, started_at: e1.at, last_at: e4.at, ended_at: e4.at }]);
+      assert.deepEqual(fake.rows("cockpit_agents"), [
+        { id: "a1", session_id: "s1", role: "implementer", started_at: e1.at, ended_at: e3.at, status: "done", label: "Lane 1" },
+      ]);
+    });
+
+    it("a label whose agent_label event sorts before its agent_start still ends on the agent's row (the real hooks race)", async (t) => {
+      // SubagentStart and the PostToolUse of a background Agent call fire together, as two processes that
+      // each stamp their own time, so their events can land in the outbox in either order.
+      // No meta file exists for this agent, as on the real client (it appears after SubagentStart has run).
+      const { fake, h, full } = await setup(t, { secret: false });
+      const launched = {
+        tool_input: { description: "Lane 1", prompt: "do the lane", subagent_type: "implementer", run_in_background: true },
+        tool_response: { isAsync: true, status: "async_launched", agentId: "r1", description: "Lane 1" },
+      };
+      quiet(await hook(h, labelled(launched)));
+      quiet(await hook(h, start("r1")));
+      assert.deepEqual(h.events().map((e) => [e.kind, e.label]), [["agent_label", "Lane 1"], ["agent_start", null]], "the label comes first, as in the race");
+      full();
+      const r = await flush(h);
+      assert.equal(r.code, 0, r.stderr);
+      assert.deepEqual(h.eventFiles(), [], "everything was sent");
+      const row = agentRow(fake, "r1");
+      assert.ok(row, "the agent has a row");
+      assert.equal(row.role, "implementer");
+      assert.equal(row.status, "running");
+      assert.equal(row.label, "Lane 1", `the agent's row has label ${JSON.stringify(row.label)}`);
+    });
+
+    it("an agent still running when the session ends is failed, one that stopped stays done", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      quiet(await hook(h, start("a1")));
+      quiet(await hook(h, start("a2")));
+      quiet(await hook(h, stopped({ agent_id: "a1" })));
+      quiet(await hook(h, ended()));
+      const [, , stop, end] = h.events();
+      full();
+      assert.equal((await flush(h)).stdout, "sent 4, waiting 0, rejected 0\n");
+      assert.deepEqual([agentRow(fake, "a1").status, agentRow(fake, "a1").ended_at], ["done", stop.at]);
+      assert.deepEqual([agentRow(fake, "a2").status, agentRow(fake, "a2").ended_at], ["failed", end.at]);
+      assert.equal(fake.rows("cockpit_sessions")[0].ended_at, end.at);
+    });
+
+    it("a resumed agent is running again, open, with its latest start", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      quiet(await hook(h, start("a1")));
+      quiet(await hook(h, stopped()));
+      await sleep(20);
+      quiet(await hook(h, start("a1")));
+      const second = h.events()[2];
+      full();
+      assert.equal((await flush(h)).stdout, "sent 3, waiting 0, rejected 0\n");
+      const row = agentRow(fake, "a1");
+      assert.deepEqual([row.status, row.ended_at, row.started_at], ["running", null, second.at]);
+      assert.equal(fake.rows("cockpit_agents").length, 1, "one row for the agent");
+    });
+
+    it("a solve's session row holds its title and level, and its decision is a row of its own", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      const r0 = await decide(s, h, ["start", "--session", "s9", "--repo", acme, "--", "small fix the readme typo"], { url: closedUrl });
+      assert.equal(r0.code, 0, r0.stderr);
+      const [session, decision] = h.events();
+      full();
+      assert.equal((await flush(h)).stdout, "sent 2, waiting 0, rejected 0\n");
+      assert.deepEqual(fake.rows("cockpit_sessions"), [
+        { id: "s9", repo: "o/acme", title: "fix the readme typo", level: "small", started_at: session.at, last_at: decision.at, ended_at: null },
+      ]);
+      assert.deepEqual(fake.rows("cockpit_decisions"), [{ session_id: "s9", point: "level", value: "small", confidence: null, source: "override", at: decision.at }]);
+    });
+
+    it("sending the same events again leaves every row as it was", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      quiet(await hook(h, start("a1")));
+      quiet(await hook(h, labelled()));
+      quiet(await hook(h, stopped()));
+      quiet(await hook(h, ended()));
+      const files = h.eventFiles().map((name) => [name, fs.readFileSync(path.join(h.outboxDir, name), "utf8")]);
+      full();
+      await flush(h);
+      const once = { sessions: fake.rows("cockpit_sessions"), agents: fake.rows("cockpit_agents") };
+      for (const [name, text] of files) fs.writeFileSync(path.join(h.outboxDir, name), text);
+      assert.equal((await flush(h)).stdout, "sent 4, waiting 0, rejected 0\n");
+      assert.deepEqual({ sessions: fake.rows("cockpit_sessions"), agents: fake.rows("cockpit_agents") }, once);
+    });
+  });
+
   describe("the hook never blocks work", () => {
     it("returns at once while Supabase is slow: the flush runs detached", async (t) => {
       const { fake, h } = await setup(t);
