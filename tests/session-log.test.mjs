@@ -157,7 +157,18 @@ describe("H-A bin/session-log", () => {
 
   describe("A2 which payloads queue which event", () => {
     const rows = [
-      ["PostToolUse of the Agent tool, in the main session", () => labelled(), { kind: "agent_label", agent_id: "a1", label: "Lane 1" }],
+      // An Agent call that names no subagent_type is a general-purpose agent: the label's role, so that it can create the row.
+      ["PostToolUse of the Agent tool, in the main session (no subagent_type)", () => labelled(), { kind: "agent_label", agent_id: "a1", label: "Lane 1", role: "general-purpose" }],
+      [
+        "PostToolUse of the Agent tool with an empty subagent_type",
+        () => labelled({ tool_input: { description: "Lane 1", subagent_type: "" } }),
+        { kind: "agent_label", agent_id: "a1", label: "Lane 1", role: "general-purpose" },
+      ],
+      [
+        "PostToolUse of the Agent tool with a subagent_type",
+        () => labelled({ tool_input: { description: "Lane 1", subagent_type: "tester" } }),
+        { kind: "agent_label", agent_id: "a1", label: "Lane 1", role: "tester" },
+      ],
       ["SubagentStop of a typed agent", () => stopped(), { kind: "agent_stop", agent_id: "a1" }],
       ["SessionEnd", () => ended(), { kind: "session_end" }],
     ];
@@ -204,7 +215,7 @@ describe("H-A bin/session-log", () => {
   });
 
   describe("A3 the flush writes each event as the fixed requests", () => {
-    it("sent 4: the nine requests of the agent's life, in order", async (t) => {
+    it("sent 4: the ten requests of the agent's life, in order", async (t) => {
       const { fake, h, full } = await setup(t, { secret: false });
       meta("s1", "a1", "Lane 1:   API routes");
       quiet(await hook(h, start("a1")));
@@ -234,6 +245,15 @@ describe("H-A bin/session-log", () => {
           { id: "a1", session_id: "s1", role: "implementer", started_at: e1.at, ended_at: null, status: "running", label: "Lane 1: API routes" },
         ],
         ["PATCH", `${REST}cockpit_sessions?id=eq.s1`, null, { last_at: e1.at, ended_at: null }],
+        // The label names no subagent_type, so its role is general-purpose and it creates the agent's row when
+        // that is missing (here it is not: ignore-duplicates leaves the row the start made as it is). The
+        // session row was ensured by the start in this run, so there is no second POST for it.
+        [
+          "POST",
+          `${REST}cockpit_agents?on_conflict=id`,
+          "resolution=ignore-duplicates, return=minimal",
+          { id: "a1", session_id: "s1", role: "general-purpose", started_at: e2.at, ended_at: null, status: "running" },
+        ],
         ["PATCH", `${REST}cockpit_agents?id=eq.a1`, null, { label: "Lane 1" }],
         ["PATCH", `${REST}cockpit_sessions?id=eq.s1`, null, { last_at: e2.at }],
         ["PATCH", `${REST}cockpit_agents?id=eq.a1`, null, { ended_at: e3.at, status: "done" }],
@@ -281,15 +301,39 @@ describe("H-A bin/session-log", () => {
       assert.deepEqual(fake.requests[3].body, { last_at: decision.at, ended_at: null });
     });
 
-    it("events that do not create a session row (label, stop, end) are only PATCHes", async (t) => {
+    it("a label creates the session row and the agent's row first, then labels: POST, POST, PATCH, PATCH", async (t) => {
       const { fake, h, full } = await setup(t, { secret: false });
       quiet(await hook(h, labelled()));
-      quiet(await hook(h, stopped()));
+      const [e] = h.events();
       full();
-      assert.equal((await flush(h)).stdout, "sent 2, waiting 0, rejected 0\n");
+      assert.equal((await flush(h)).stdout, "sent 1, waiting 0, rejected 0\n");
+      assert.deepEqual(
+        fake.requests.map((x) => `${x.method} ${x.path}`),
+        [
+          `POST ${REST}cockpit_sessions?on_conflict=id`,
+          `POST ${REST}cockpit_agents?on_conflict=id`,
+          `PATCH ${REST}cockpit_agents?id=eq.a1`,
+          `PATCH ${REST}cockpit_sessions?id=eq.s1`,
+        ],
+      );
+      assert.equal(fake.requests[0].prefer, "resolution=ignore-duplicates, return=minimal");
+      assert.equal(fake.requests[1].prefer, "resolution=ignore-duplicates, return=minimal");
+      assert.deepEqual(fake.requests[1].body, { id: "a1", session_id: "s1", role: "general-purpose", started_at: e.at, ended_at: null, status: "running" });
+      assert.deepEqual(fake.requests[2].body, { label: "Lane 1" });
+    });
+
+    it("events that create no row (stop, end, and a label queued by an earlier version without a role) are only PATCHes", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      fs.mkdirSync(h.outboxDir, { recursive: true });
+      const roleless = { v: 1, kind: "agent_label", session_id: "s1", at: "2026-10-05T10:00:00.000Z", repo: "o/acme", agent_id: "a1", label: "Lane 1" };
+      fs.writeFileSync(path.join(h.outboxDir, `${Date.parse(roleless.at)}-1-0000.json`), `${JSON.stringify(roleless)}\n`);
+      quiet(await hook(h, stopped()));
+      quiet(await hook(h, ended()));
+      full();
+      assert.equal((await flush(h)).stdout, "sent 3, waiting 0, rejected 0\n");
       assert.deepEqual(
         fake.requests.map((x) => x.method),
-        ["PATCH", "PATCH", "PATCH", "PATCH"],
+        ["PATCH", "PATCH", "PATCH", "PATCH", "PATCH", "PATCH"],
       );
     });
 

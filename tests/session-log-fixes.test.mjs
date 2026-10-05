@@ -12,6 +12,23 @@ import { sessionKit } from "./session-kit.mjs";
 
 const REST = "/rest/v1/";
 
+// A seeded shuffle, so that a failing order can be replayed from its seed.
+const prng = (seed) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+  return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+};
+const shuffled = (items, seed) => {
+  const rand = prng(seed);
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+};
+
 describe("R2 bin/session-log fixes", () => {
   const s = scratch("harness-sessionlog-r2-");
   const acme = makeRepo(s, "acme", { origin: "git@github.com:o/acme.git" });
@@ -41,13 +58,100 @@ describe("R2 bin/session-log fixes", () => {
       });
     }
 
-    it("without a subagent_type the label creates no row: it only labels a row that exists", async (t) => {
+    // An Agent call may omit subagent_type: the engine runs a general-purpose agent, and its SubagentStart
+    // reports that as the agent_type (sessions verify-2 G2-parallel, untyped spawns).
+    for (const [name, toolInput] of [
+      ["without a subagent_type", { description: "Lane 1", prompt: "do the lane", run_in_background: true }],
+      ["with an empty subagent_type", { description: "Lane 1", prompt: "do the lane", subagent_type: "", run_in_background: true }],
+    ]) {
+      it(`${name} the label takes the role general-purpose and creates the row, running and labelled`, async (t) => {
+        const { fake, h, full } = await setup(t, { secret: false });
+        quiet(await hook(h, launched("r1", "Lane 1", "implementer", { tool_input: toolInput })));
+        const [event] = h.events();
+        assert.deepEqual([event.kind, event.role, event.label], ["agent_label", "general-purpose", "Lane 1"]);
+        full();
+        const r = await flush(h);
+        assert.equal(r.code, 0, r.stderr);
+        assert.equal(r.stdout, "sent 1, waiting 0, rejected 0\n");
+        assert.deepEqual(fake.rows("cockpit_agents"), [
+          { id: "r1", session_id: "s1", role: "general-purpose", started_at: event.at, ended_at: null, status: "running", label: "Lane 1" },
+        ]);
+        assert.deepEqual(fake.rows("cockpit_sessions"), [{ id: "s1", repo: "o/acme", title: null, level: null, started_at: event.at, last_at: event.at, ended_at: null }]);
+      });
+    }
+
+    it("an untyped spawn's start after its label keeps the label and sets the role the start reports", async (t) => {
       const { fake, h, full } = await setup(t, { secret: false });
       quiet(await hook(h, launched("r1", "Lane 1", "implementer", { tool_input: { description: "Lane 1" } })));
-      assert.equal(h.events()[0].kind, "agent_label");
+      quiet(await hook(h, start("r1", { agent_type: "general-purpose" })));
+      quiet(await hook(h, launched("r2", "Lane 2", "implementer", { tool_input: { description: "Lane 2" } })));
+      quiet(await hook(h, start("r2", { agent_type: "implementer" }))); // reports another role than the label's default
+      assert.deepEqual(h.events().map((e) => [e.kind, e.agent_id, e.role]), [
+        ["agent_label", "r1", "general-purpose"],
+        ["agent_start", "r1", "general-purpose"],
+        ["agent_label", "r2", "general-purpose"],
+        ["agent_start", "r2", "implementer"],
+      ]);
       full();
-      assert.equal((await flush(h)).stdout, "sent 1, waiting 0, rejected 0\n");
-      assert.deepEqual(fake.rows("cockpit_agents"), []);
+      assert.equal((await flush(h)).stdout, "sent 4, waiting 0, rejected 0\n");
+      assert.deepEqual(
+        fake.rows("cockpit_agents").map((row) => [row.id, row.role, row.label, row.status, row.ended_at]),
+        [
+          ["r1", "general-purpose", "Lane 1", "running", null],
+          ["r2", "implementer", "Lane 2", "running", null],
+        ],
+      );
+    });
+
+    it("an untyped spawn's label never touches an agent that has its row: role, start, status and end stay", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      quiet(await hook(h, start("a1", { agent_type: "general-purpose" })));
+      quiet(await hook(h, stopped("a1", { agent_type: "general-purpose" })));
+      quiet(await hook(h, launched("a1", "Lane 9", "implementer", { tool_input: { description: "Lane 9" } })));
+      const [began, finished] = h.events();
+      full();
+      assert.equal((await flush(h)).stdout, "sent 3, waiting 0, rejected 0\n");
+      assert.deepEqual(fake.rows("cockpit_agents"), [
+        { id: "a1", session_id: "s1", role: "general-purpose", started_at: began.at, ended_at: finished.at, status: "done", label: "Lane 9" },
+      ]);
+    });
+
+    describe("a label without a role, queued by an earlier version, still validates and only labels a row that exists", () => {
+      // The queued shape of that version: no `role` on the agent_label event.
+      const roleless = (at, label = "Lane 1") => ({ v: 1, kind: "agent_label", session_id: "s1", at, repo: "o/acme", agent_id: "a1", label });
+      const queue = (h, event, seq = 0) => {
+        fs.mkdirSync(h.outboxDir, { recursive: true });
+        fs.writeFileSync(path.join(h.outboxDir, `${Date.parse(event.at)}-1-${String(seq).padStart(4, "0")}.json`), `${JSON.stringify(event)}\n`);
+      };
+
+      it("it is sent, not rejected, and creates neither the agent nor the session: only PATCHes", async (t) => {
+        const { fake, h, full } = await setup(t, { secret: false });
+        queue(h, roleless("2026-10-05T10:00:00.000Z"));
+        full();
+        const r = await flush(h);
+        assert.equal(r.code, 0, r.stderr);
+        assert.equal(r.stdout, "sent 1, waiting 0, rejected 0\n");
+        assert.deepEqual(h.rejectedFiles(), []);
+        assert.deepEqual(
+          fake.requests.map((q) => `${q.method} ${q.path}`),
+          [`PATCH ${REST}cockpit_agents?id=eq.a1`, `PATCH ${REST}cockpit_sessions?id=eq.s1`],
+        );
+        assert.deepEqual(fake.requests[0].body, { label: "Lane 1" });
+        assert.deepEqual(fake.rows("cockpit_agents"), []);
+        assert.deepEqual(fake.rows("cockpit_sessions"), []);
+      });
+
+      it("it labels the row that its agent's start created, and changes nothing else on it", async (t) => {
+        const { fake, h, full } = await setup(t, { secret: false });
+        quiet(await hook(h, start("a1")));
+        const [began] = h.events();
+        queue(h, roleless(new Date(Date.parse(began.at) + 50).toISOString(), "Lane 1"), 1);
+        full();
+        assert.equal((await flush(h)).stdout, "sent 2, waiting 0, rejected 0\n");
+        assert.deepEqual(fake.rows("cockpit_agents"), [
+          { id: "a1", session_id: "s1", role: "implementer", started_at: began.at, ended_at: null, status: "running", label: "Lane 1" },
+        ]);
+      });
     });
 
     for (const [name, stopFirst] of [
@@ -102,21 +206,6 @@ describe("R2 bin/session-log fixes", () => {
       { name: `start ${id}`, payload: start(id, { agent_type: ROLES[i % 4] }) },
       { name: `label ${id}`, payload: launched(id, `Lane ${i + 1}`, ROLES[i % 4]) },
     ]);
-    const prng = (seed) => () => {
-      seed = (seed + 0x6d2b79f5) | 0;
-      let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-      x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
-      return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
-    };
-    const shuffled = (items, seed) => {
-      const rand = prng(seed);
-      const out = [...items];
-      for (let i = out.length - 1; i > 0; i--) {
-        const j = Math.floor(rand() * (i + 1));
-        [out[i], out[j]] = [out[j], out[i]];
-      }
-      return out;
-    };
     const expectRows = (fake, why) => {
       const rows = fake.rows("cockpit_agents");
       assert.equal(rows.length, 20, `${rows.length} rows; ${why}`);
@@ -148,6 +237,54 @@ describe("R2 bin/session-log fixes", () => {
     it("all 40 hooks at once, each with its own detached flusher (the real race)", async (t) => {
       const { fake, h } = await setup(t);
       const runs = await Promise.all(shuffled(events, 3).map(({ payload }) => hook(h, payload)));
+      for (const r of runs) quiet(r, "parallel hook");
+      await drained(h);
+      await sleep(300);
+      expectRows(fake, "parallel run");
+      assert.deepEqual(h.rejectedFiles(), []);
+      assert.equal(fs.existsSync(path.join(h.outboxDir, ".lock")), false);
+    });
+  });
+
+  // The same burst when the Agent calls name no subagent_type (verify-2 G2-parallel): the label has no role of
+  // its own then, and a start that comes after it must still find the row labelled.
+  describe("20 untyped agents spawned at once: every start and label, in any order, ends on its row with the role general-purpose", () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `u${String(i + 1).padStart(2, "0")}`);
+    const untyped = (id, i) => launched(id, `Lane ${i + 1}`, "implementer", { tool_input: { description: `Lane ${i + 1}`, prompt: "do the lane", run_in_background: true } });
+    const events = ids.flatMap((id, i) => [
+      { name: `start ${id}`, payload: start(id, { agent_type: "general-purpose" }) },
+      { name: `label ${id}`, payload: untyped(id, i) },
+    ]);
+    const expectRows = (fake, why) => {
+      const rows = fake.rows("cockpit_agents");
+      assert.equal(rows.length, 20, `${rows.length} rows; ${why}`);
+      ids.forEach((id, i) => {
+        const row = rows.find((r) => r.id === id);
+        assert.ok(row, `${id} has no row; ${why}`);
+        assert.deepEqual([row.role, row.label, row.status, row.ended_at], ["general-purpose", `Lane ${i + 1}`, "running", null], `${id}; ${why}`);
+      });
+    };
+
+    describe("hooks run one after the other, in a shuffled order", { concurrency: 3 }, () => {
+      for (const seed of [11, 2024, Math.floor(Math.random() * 2 ** 31)]) {
+        it(`seed ${seed}`, async (t) => {
+          const { fake, h, full } = await setup(t, { secret: false });
+          const order = shuffled(events, seed);
+          for (const { payload } of order) quiet(await hook(h, payload));
+          const queued = h.events().map((e) => `${e.kind === "agent_label" ? "label" : "start"} ${e.agent_id}`);
+          assert.deepEqual(queued, order.map((e) => e.name), "the outbox holds the events in the order they were run");
+          full();
+          const r = await flush(h);
+          assert.equal(r.stdout, "sent 40, waiting 0, rejected 0\n");
+          expectRows(fake, `seed ${seed}, order: ${queued.join(", ")}`);
+          assert.equal(fake.rows("cockpit_sessions").length, 1);
+        });
+      }
+    });
+
+    it("all 40 hooks at once, each with its own detached flusher (the real race)", async (t) => {
+      const { fake, h } = await setup(t);
+      const runs = await Promise.all(shuffled(events, 5).map(({ payload }) => hook(h, payload)));
       for (const r of runs) quiet(r, "parallel hook");
       await drained(h);
       await sleep(300);

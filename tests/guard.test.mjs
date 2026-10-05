@@ -503,6 +503,90 @@ describe("H-D hooks/guard.sh", () => {
     });
   });
 
+  // 8864b24: a heredoc is fed to its own command and to a later stage of its pipeline on the same line, so
+  // cat <<'EOF' | bash runs the body as code and cat <<'EOF' | node reads it for the key rule; ; && and ||
+  // end the pipeline, and a heredoc on an earlier line is not fed to the next line's pipe.
+  describe("R3 a heredoc piped into a shell is code, and piped into an interpreter it is read for the key rule", () => {
+    const only = /only for bin\/decide and bin\/session-log/;
+    const decide = "bin/decide level x";
+    // `tail` is what follows the heredoc's marker on its line.
+    const piped = (tail, body = decide, marker = "<<'EOF'") => `cat ${marker} ${tail}\n${body}\nEOF`;
+    const harnessEnvJev = "process.loadEnvFile(process.env.HOME + '/.agent-harness/.env')\nfetch('https://project.example.test/rest/v1/y')";
+    const projectEnvJev = "process.loadEnvFile('.env')\nfetch('https://project.example.test/rest/v1/y')";
+
+    describe("a sub-agent: the body that follows a pipe into a shell is code", { concurrency: 8 }, () => {
+      table(
+        [
+          ["| bash", piped("| bash"), /orchestrator/],
+          ["| sudo bash -s", piped("| sudo bash -s"), /orchestrator/],
+          ["| /bin/sh -s", piped("| /bin/sh -s"), /orchestrator/],
+          ["| (bash)", piped("| (bash)"), /orchestrator/],
+          ["| tee x |& bash (a later stage of the pipeline)", piped("| tee x |& bash"), /orchestrator/],
+          ["|& bash", piped("|& bash"), /orchestrator/],
+          ["| tee x | bash", piped("| tee x | bash"), /orchestrator/],
+          ["| cat | cat | zsh", piped("| cat | cat | zsh"), /orchestrator/],
+          ["| env bash", piped("| env bash"), /orchestrator/],
+          ["| bash -s -- arg", piped("| bash -s -- arg"), /orchestrator/],
+          ["| bash with no space after the pipe", piped("|bash"), /orchestrator/],
+          ["an unquoted heredoc | bash", piped("| bash", decide, "<<EOF"), /orchestrator/],
+          ["a <<- heredoc | bash", `cat <<-'EOF' | bash\n\t${decide}\n\tEOF`, /orchestrator/],
+          ["a bin/session-log flush against the live harness | bash", piped("| bash", "bin/session-log flush"), /scratch HARNESS_DIR/],
+          ["a call on a later line of the body", piped("| bash", "echo hi\nbin/decide start -- x"), /orchestrator/],
+          ["the heredoc after other commands on its line", `cd /repo && cat <<'EOF' | bash\n${decide}\nEOF`, /orchestrator/],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("a sub-agent: the body is data when the pipeline does not reach a shell", { concurrency: 8 }, () => {
+      table(
+        [
+          ["|| bash", piped("|| bash"), true],
+          ["&& bash", piped("&& bash"), true],
+          ["> f; echo | bash", piped("> f; echo | bash"), true],
+          ["; bash", piped("; bash"), true],
+          ["| shellcheck -", piped("| shellcheck -"), true],
+          ["| git commit -F -", piped("| git commit -F -"), true],
+          ["| ssh host bash", piped("| ssh host bash"), true],
+          ["| grep", piped("| grep decide"), true],
+          ["| less", piped("| less"), true],
+          ["a pipe into a shell on a later line", `${piped("> f", decide)}\necho hi | bash`, true],
+          ["a quoted heredoc | bash whose body calls nothing guarded", piped("| bash", "echo hello"), true],
+          ["a scratch call in a body | bash", piped("| bash", "HARNESS_DIR=/tmp/h bin/session-log flush"), true],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("the main agent may call bin/decide in a body piped into a shell", { concurrency: 8 }, () => {
+      table([
+        ["| bash", piped("| bash"), true],
+        ["| sudo bash -s", piped("| sudo bash -s"), true],
+        ["| tee x |& bash", piped("| tee x |& bash"), true],
+        ["|| bash", piped("|| bash"), true],
+      ]);
+    });
+
+    // An interpreter after the pipe reads the body as its code: the harness .env with Jev or Supabase is denied
+    // for both agents, the project's own .env and a pipe that never reaches the interpreter are not.
+    const interpreterRows = [
+      ["cat <<'EOF' | node loading the harness .env, then Jev", piped("| node", harnessEnvJev), only],
+      ["| node - loading the harness .env, then Jev", piped("| node -", harnessEnvJev), only],
+      ["| tee x | node loading the harness .env", piped("| tee x | node", harnessEnvJev), only],
+      ["| python3 - loading the harness .env, then Supabase", piped("| python3 -", "from dotenv import load_dotenv\nload_dotenv('/home/u/.agent-harness/.env')\nimport os; os.environ['COCKPIT_SUPABASE_SECRET_KEY']"), only],
+      ["an unquoted heredoc | node loading the harness .env", piped("| node", harnessEnvJev, "<<EOF"), only],
+      ["| node, the project's own .env", piped("| node", projectEnvJev), true],
+      ["| node, the harness .env named but no Jev or Supabase", piped("| node", "console.log(require('fs').existsSync(process.env.HOME + '/.agent-harness/.env'))"), true],
+      ["|| node, the harness .env and Jev (the body is data)", piped("|| node", harnessEnvJev), true],
+      ["&& node, the harness .env and Jev (the body is data)", piped("&& node", harnessEnvJev), true],
+      ["> f; node, the harness .env and Jev (the body is data)", piped("> f; node", harnessEnvJev), true],
+      ["| shellcheck -, the harness .env and Jev (the body is data)", piped("| shellcheck -", harnessEnvJev), true],
+      ["| ssh host node, the harness .env and Jev (the body is data)", piped("| ssh host node", harnessEnvJev), true],
+    ];
+    describe("the main agent, an interpreter after the pipe", { concurrency: 8 }, () => table(interpreterRows));
+    describe("a sub-agent, an interpreter after the pipe", { concurrency: 8 }, () => table(interpreterRows, { agent: true }));
+  });
+
   describe("R2 a backslash-newline joins lines as in bash", () => {
     table(
       [
@@ -522,7 +606,7 @@ describe("H-D hooks/guard.sh", () => {
 
   // The guard reads only commands that name bin/decide, bin/session-log or a .env literally (its header says so),
   // so these still pass today. They are pinned as the known limit: if the guard learns to read them, flip the
-  // rows to denies.
+  // rows to denies. The README lists them too, with the other known limits (R3 known limits, below).
   describe("R2 known limit: a name split by quotes or a line continuation still passes", () => {
     table(
       [
@@ -534,6 +618,73 @@ describe("H-D hooks/guard.sh", () => {
       ],
       { agent: true },
     );
+  });
+
+  // The README (Decisions) lists what still passes, and each form is probed against the guard: a name kept in a
+  // variable, escaped, split by quotes or a line continuation, a path built from string parts in node -e, and a
+  // cat of the harness .env inside a substitution. The rows pin them as the documented limit: if the guard learns
+  // to read one, flip its row to a deny and take it out of the README's list; if the README drops one, say so here.
+  describe("R3 known limits the README documents still pass, and the README says so", () => {
+    const readme = fs.readFileSync(path.join(REPO, "README.md"), "utf8").replace(/\s+/g, " ");
+    const harnessEnvJev = "https://api.typesafe.ai/v1/systemone";
+    // [what the README names, a command that uses it]
+    const decideRows = [
+      ["b=bin/decide; $b level x", "b=bin/decide; $b level x"],
+      ["bin/\\decide", "bin/\\decide level x"],
+      ['bin/de"ci"de', 'bin/de"ci"de level x'],
+    ];
+    const keyRows = [
+      [
+        "'.agent-' + 'harness/.env' in `node -e`",
+        "node -e \"process.loadEnvFile(process.env.HOME + '/.agent-' + 'harness/.env'); fetch(process.env.COCKPIT_SUPABASE_URL + '/rest/v1/x')\"",
+      ],
+      ["env $(cat ~/.agent-harness/.env | xargs) …", `env $(cat ~/.agent-harness/.env | xargs) curl ${harnessEnvJev}`],
+    ];
+
+    describe("a sub-agent: a name the guard does not read literally", { concurrency: 8 }, () => {
+      table(
+        decideRows.map(([name, command]) => [name, command, true]),
+        { agent: true },
+      );
+    });
+
+    describe("the same forms with bin/session-log", { concurrency: 8 }, () => {
+      table(
+        [
+          ["a name kept in a variable", "b=bin/session-log; $b flush", true],
+          ["a name escaped", "bin/\\session-log flush", true],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("the harness .env reached without naming it literally, for both agents", { concurrency: 8 }, () => {
+      const rows = keyRows.map(([name, command]) => [name, command, true]);
+      describe("the main agent", { concurrency: 8 }, () => table(rows));
+      describe("a sub-agent", { concurrency: 8 }, () => table(rows, { agent: true }));
+    });
+
+    it("the README says the guard reads a command's text for a literal name, so it stops mistakes, not a determined agent", () => {
+      assert.match(readme, /reads a command's text, roughly as a shell splits it/);
+      assert.match(readme, /only when the text names `bin\/decide`, `bin\/session-log` or a `\.env` literally/);
+      assert.match(readme, /stops mistakes, not a determined agent/);
+    });
+
+    it("the README lists each of these as a known limit that still passes", () => {
+      const at = readme.indexOf("Known limits that still pass:");
+      assert.ok(at > -1, "README.md has no 'Known limits that still pass:' list");
+      const list = readme.slice(at, readme.indexOf("\n", at) > -1 ? readme.indexOf("\n", at) : undefined);
+      for (const form of [
+        "a name kept in a variable (`b=bin/decide; $b level x`)",
+        "escaped (`bin/\\decide`)",
+        'split by quotes (`bin/de"ci"de`)',
+        "or by a line continuation",
+        "a path built from string parts (`'.agent-' + 'harness/.env'` in `node -e`)",
+        "a `cat` of the harness `.env` inside a substitution (`env $(cat ~/.agent-harness/.env | xargs) …`)",
+      ]) {
+        assert.ok(list.includes(form), `the README's known limits do not say: ${form}`);
+      }
+    });
   });
 
   describe("R2 1 MB lines with hundreds of thousands of substitutions are read in time", () => {
@@ -567,6 +718,8 @@ describe("H-D hooks/guard.sh", () => {
       ["a 1 MB env chain in front of bin/session-log", `env ${repeat("A=$(x) ", MB)}bin/session-log flush`, 2],
       ["1 MB of $(..) arguments, then bin/decide as the next command", `echo ${repeat("$(date) ", MB)}; bin/decide level x`, 2],
       ["an unquoted heredoc of 20,000 lines with $( ) and backticks, then bin/decide", `cat <<EOF\n${lines(20_000, (i) => `line ${i} $(date) and \`pwd\` here`)}\nEOF\nbin/decide level x`, 2],
+      ["1 MB of pipe stages after a heredoc, the last one bash, with bin/decide in the body", `cat <<'EOF'${repeat(" | cat", MB)} | bash\nbin/decide level x\nEOF`, 2],
+      ["1 MB of pipe stages after a heredoc, none a shell, with bin/decide in the body", `cat <<'EOF'${repeat(" | cat", MB)}\nbin/decide level x\nEOF`, 0],
     ];
     for (const [name, command, expected] of shapes) it(`${name}: ${expected === 0 ? "allowed" : "denied"} within ${BUDGET_MS} ms`, (t) => timedBest(t, command, expected));
   });
