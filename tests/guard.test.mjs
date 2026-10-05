@@ -520,8 +520,9 @@ describe("H-D hooks/guard.sh", () => {
     );
   });
 
-  // The guard first looks for the literal name in the command text, so these still pass today. They are pinned
-  // as the known limit: if the guard learns to read them, flip the rows to denies.
+  // The guard reads only commands that name bin/decide, bin/session-log or a .env literally (its header says so),
+  // so these still pass today. They are pinned as the known limit: if the guard learns to read them, flip the
+  // rows to denies.
   describe("R2 known limit: a name split by quotes or a line continuation still passes", () => {
     table(
       [
