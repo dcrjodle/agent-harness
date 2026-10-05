@@ -1,14 +1,15 @@
-// H-E: setup.sh wires the hooks (plan D6). It runs from a copy of the harness under a scratch HOME, so the
-// real ~/.claude, ~/.codex and ~/.agent-harness are never touched and this checkout stays clean.
+// H-E: setup.sh wires the hooks (plan D6, sessions plan S5). It runs from a copy of the harness under a scratch
+// HOME, so the real ~/.claude, ~/.codex and ~/.agent-harness are never touched and this checkout stays clean.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { REPO, canonical, readJson, run, scratch } from "./helpers.mjs";
+import { EVENT_NAME, REPO, canonical, readJson, run, scratch } from "./helpers.mjs";
 
 const GUARD_MATCHER = "Bash|Agent|Task|Read|Grep|Edit|Write|mcp__.*";
 const HARNESS_HOOK = ".agent-harness/hooks/";
 const HOOK_KEYS = ["type", "command", "timeout"];
+const EXECUTABLES = ["bin/decide", "bin/session-log", "hooks/decide-context.sh", "hooks/guard.sh", "hooks/session-log.sh"];
 
 describe("H-E setup.sh", () => {
   const s = scratch("harness-setup-");
@@ -21,6 +22,7 @@ describe("H-E setup.sh", () => {
     hooks: {
       PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo foreign-pretool" }] }],
       UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo foreign-prompt", timeout: 5 }] }],
+      PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo foreign-post" }] }],
     },
   };
 
@@ -34,7 +36,7 @@ describe("H-E setup.sh", () => {
     const skip = new Set([".git", "node_modules", "logs", ".env", "MACHINE.md", "tests"].map((name) => path.join(REPO, name)));
     skip.add(path.join(REPO, "cache", "recipes"));
     fs.cpSync(REPO, copy, { recursive: true, filter: (src) => !skip.has(src) });
-    for (const file of ["bin/decide", "hooks/decide-context.sh", "hooks/guard.sh"]) fs.chmodSync(path.join(copy, file), 0o644);
+    for (const file of EXECUTABLES) fs.chmodSync(path.join(copy, file), 0o644);
     home = s.home;
     claudeFile = path.join(home, ".claude", "settings.json");
     codexFile = path.join(home, ".codex", "hooks.json");
@@ -86,16 +88,39 @@ describe("H-E setup.sh", () => {
       assert.equal(entry.hooks[0].timeout, 30);
     });
 
-    it("SubagentStart and SubagentStop have stage-log entries", () => {
-      for (const event of ["SubagentStart", "SubagentStop"]) {
-        assert.equal(harnessEntries(cfg, event, "hooks/stage-log.sh").length, 1, event);
+    it("SubagentStart, SubagentStop and PostToolUse (Agent) each have one session-log entry, timeout 10", () => {
+      for (const event of ["SubagentStart", "SubagentStop", "PostToolUse"]) {
+        const entries = harnessEntries(cfg, event, "hooks/session-log.sh");
+        assert.equal(entries.length, 1, event);
         assert.equal(harnessEntries(cfg, event).length, 1, event);
+        assert.equal(entries[0].hooks.length, 1, event);
+        assert.equal(entries[0].hooks[0].timeout, 10, event);
       }
+      assert.equal(harnessEntries(cfg, "PostToolUse", "hooks/session-log.sh")[0].matcher, "Agent");
+      for (const event of ["SubagentStart", "SubagentStop"]) assert.ok(!("matcher" in harnessEntries(cfg, event)[0]), `${event} has no matcher`);
     });
 
-    it("has no duplicates: six harness hooks in all", () => {
+    it("SessionEnd has one session-log entry, timeout 5", () => {
+      const entries = harnessEntries(cfg, "SessionEnd", "hooks/session-log.sh");
+      assert.equal(entries.length, 1);
+      assert.equal(harnessEntries(cfg, "SessionEnd").length, 1);
+      assert.equal(entries[0].hooks.length, 1);
+      assert.equal(entries[0].hooks[0].timeout, 5);
+    });
+
+    it("keeps the foreign PostToolUse entry, in front of the harness's", () => {
+      assert.deepEqual(cfg.hooks.PostToolUse[0], initial.hooks.PostToolUse[0]);
+      assert.equal(cfg.hooks.PostToolUse.length, 2);
+    });
+
+    it("no command mentions stage-log any more", () => {
+      for (const hook of hookObjects(cfg)) assert.ok(!hook.command.includes("stage-log"), hook.command);
+      assert.ok(!afterSecond.claude.includes("stage-log"));
+    });
+
+    it("has no duplicates: eight harness hooks in all", () => {
       const commands = hookObjects(cfg).map((h) => h.command).filter((c) => c.includes(HARNESS_HOOK));
-      assert.equal(commands.length, 6, commands.join("\n"));
+      assert.equal(commands.length, 8, commands.join("\n"));
     });
 
     it("hook objects carry only type, command and timeout", () => {
@@ -119,8 +144,9 @@ describe("H-E setup.sh", () => {
       assert.deepEqual(readJson(`${claudeFile}.pre-harness`), initial);
     });
 
-    it("Codex gets the guard and the session context, and no decide-context, UserPromptExpansion or stage-log", () => {
+    it("Codex gets the guard and the session context, and no decide-context, UserPromptExpansion or session-log", () => {
       assert.ok(!afterSecond.codex.includes("decide-context"));
+      assert.ok(!afterSecond.codex.includes("session-log"));
       assert.ok(!afterSecond.codex.includes("stage-log"));
       const codex = JSON.parse(afterSecond.codex);
       assert.deepEqual(Object.keys(codex.hooks).sort(), ["PreToolUse", "SessionStart"]);
@@ -130,16 +156,23 @@ describe("H-E setup.sh", () => {
       for (const hook of hookObjects(codex)) assert.ok(Object.keys(hook).every((key) => HOOK_KEYS.includes(key)), JSON.stringify(hook));
     });
 
-    it("makes bin/decide and the hooks executable, and they are executable in this checkout too", () => {
-      for (const file of ["bin/decide", "hooks/decide-context.sh", "hooks/guard.sh"]) {
+    it("makes the scripts executable (bin/session-log and hooks/session-log.sh too), and they are executable in this checkout too", () => {
+      for (const file of EXECUTABLES) {
         assert.ok(fs.statSync(path.join(copy, file)).mode & 0o111, `setup left ${file} not executable`);
         fs.accessSync(path.join(REPO, file), fs.constants.X_OK);
       }
     });
 
-    it("creates .env from .env.example with one empty TYPESAFE_API_KEY line", () => {
+    it("stage-log and stage-times are gone from the copy", () => {
+      assert.equal(fs.existsSync(path.join(copy, "hooks", "stage-log.sh")), false);
+      assert.equal(fs.existsSync(path.join(copy, "bin", "stage-times")), false);
+    });
+
+    it("creates .env from .env.example with one empty line for each of the three keys", () => {
       const lines = fs.readFileSync(path.join(copy, ".env"), "utf8").split("\n");
-      assert.equal(lines.filter((line) => line === "TYPESAFE_API_KEY=").length, 1);
+      for (const key of ["TYPESAFE_API_KEY", "COCKPIT_SUPABASE_URL", "COCKPIT_SUPABASE_SECRET_KEY"]) {
+        assert.equal(lines.filter((line) => line === `${key}=`).length, 1, key);
+      }
     });
 
     it("links the harness into the scratch HOME only", () => {
@@ -184,6 +217,29 @@ describe("H-E setup.sh", () => {
         assert.equal(allowed.code, 0, allowed.stderr);
       });
 
+      it("the session-log commands queue the session's events in the harness they live in, silently", async () => {
+        const outbox = path.join(copy, "logs", "session-outbox");
+        const payloads = {
+          SubagentStart: { hook_event_name: "SubagentStart", session_id: "s1", agent_id: "a1", agent_type: "implementer", cwd: s.root },
+          PostToolUse: { hook_event_name: "PostToolUse", session_id: "s1", tool_name: "Agent", tool_input: { description: "Lane 1" }, tool_response: { agentId: "a1" }, cwd: s.root },
+          SubagentStop: { hook_event_name: "SubagentStop", session_id: "s1", agent_id: "a1", agent_type: "implementer", cwd: s.root },
+          SessionEnd: { hook_event_name: "SessionEnd", session_id: "s1", cwd: s.root },
+        };
+        for (const [event, payload] of Object.entries(payloads)) {
+          const [entry] = harnessEntries(cfg, event, "hooks/session-log.sh");
+          const r = await runRegistered(commandOf(entry), payload);
+          assert.equal(r.code, 0, `${event}: ${r.stderr}`);
+          assert.equal(r.stdout, "", event);
+          assert.equal(r.stderr, "", event);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        const files = fs.readdirSync(outbox).filter((name) => EVENT_NAME.test(name)).sort();
+        assert.deepEqual(
+          files.map((name) => readJson(path.join(outbox, name)).kind),
+          ["agent_start", "agent_label", "agent_stop", "session_end"],
+        );
+      });
+
       it("a registered command whose script is missing does nothing and exits 0", async () => {
         const r = await run("sh", ["-c", commandOf(cfg.hooks.UserPromptExpansion[0])], {
           input: "{}",
@@ -223,9 +279,13 @@ describe("H-E setup.sh", () => {
       assert.equal(harnessEntries(cfg, "PreToolUse", "hooks/decide-context.sh").length, 1);
       assert.equal(harnessEntries(cfg, "UserPromptExpansion").length, 1);
       assert.equal(harnessEntries(cfg, "SessionStart").length, 1);
-      assert.equal(harnessEntries(cfg, "SubagentStart").length, 1);
-      assert.equal(harnessEntries(cfg, "SubagentStop").length, 1);
-      assert.equal(hookObjects(cfg).filter((h) => h.command.includes(HARNESS_HOOK)).length, 6);
+      for (const event of ["SubagentStart", "SubagentStop", "SessionEnd"]) {
+        assert.equal(harnessEntries(cfg, event).length, 1, event);
+        assert.equal(harnessEntries(cfg, event, "hooks/session-log.sh").length, 1, `${event}: the stage-log entry is replaced by a session-log entry`);
+      }
+      assert.equal(harnessEntries(cfg, "PostToolUse", "hooks/session-log.sh").length, 1);
+      assert.ok(!JSON.stringify(cfg).includes("stage-log"), "no stage-log entry is left");
+      assert.equal(hookObjects(cfg).filter((h) => h.command.includes(HARNESS_HOOK)).length, 8);
     });
   });
 });

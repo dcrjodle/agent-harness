@@ -1,7 +1,8 @@
 // Shared helpers for the harness tests: a scratch directory with its own HOME, a scratch HARNESS_DIR,
 // process runners, git fixtures and a small JSON Schema validator. Every process the tests start gets
 // the scratch HOME and an explicit environment, so nothing reaches the real ~, ~/.agent-harness or
-// ~/.claude, and bin/decide is only ever pointed at a loopback URL (a fake Jev or a closed port).
+// ~/.claude, and bin/decide and bin/session-log are only ever pointed at a loopback URL (a fake Jev or
+// Supabase, or a closed port).
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -11,14 +12,20 @@ import { fileURLToPath } from "node:url";
 
 export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DECIDE = path.join(REPO, "bin", "decide");
+export const SESSION_LOG = path.join(REPO, "bin", "session-log");
 export const HOOK = path.join(REPO, "hooks", "decide-context.sh");
+export const SESSION_HOOK = path.join(REPO, "hooks", "session-log.sh");
 export const GUARD = path.join(REPO, "hooks", "guard.sh");
 export const SETUP = path.join(REPO, "setup.sh");
 export const SETTINGS_FILE = path.join(REPO, "settings.json");
 export const SCHEMA_FILE = path.join(REPO, "settings.schema.json");
 
-// The keys of a line in logs/decisions.jsonl, in order.
-export const LOG_KEYS = ["v", "time", "point", "value", "confidence", "probabilities", "source", "reason", "model", "inputHash", "repo", "ms"];
+// The keys of the decision object `bin/decide --json` prints (D3), in order.
+export const DECISION_KEYS = ["v", "time", "point", "value", "confidence", "probabilities", "source", "reason", "model", "inputHash", "repo", "ms"];
+
+// The only secret the tests use, and the file names of an outbox event.
+export const SECRET = "sb_secret_test";
+export const EVENT_NAME = /^\d{13}-\d+-\d{4}\.json$/;
 
 export const canonical = (doc) => `${JSON.stringify(doc, null, 2)}\n`;
 export const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -26,6 +33,9 @@ export const clone = (doc) => JSON.parse(JSON.stringify(doc));
 
 // ---------- processes ----------
 
+// The environment of every process the tests start, built from scratch: nothing of the tester's own
+// environment but PATH, so a Claude Code session id or a key in it never reaches a child. `extra` adds to
+// it, and is the one place a test sets CLAUDE_CODE_SESSION_ID.
 export function baseEnv(home, extra = {}) {
   const env = {
     PATH: process.env.PATH,
@@ -38,6 +48,7 @@ export function baseEnv(home, extra = {}) {
     GIT_AUTHOR_EMAIL: "test@example.com",
     GIT_COMMITTER_NAME: "Test",
     GIT_COMMITTER_EMAIL: "test@example.com",
+    CLAUDE_CODE_SESSION_ID: undefined,
     ...extra,
   };
   for (const key of Object.keys(env)) if (env[key] === undefined || env[key] === null) delete env[key];
@@ -101,14 +112,16 @@ export function scratch(prefix = "harness-test-") {
   };
 }
 
-// A git repo on a branch with one commit; `name` is its folder name (its "main checkout folder").
-export function makeRepo(s, name, { branch = "main", parent = s.root } = {}) {
+// A git repo on a branch with one commit; `name` is its folder name (its "main checkout folder"), `origin`
+// the URL of its origin remote (none by default; it is never contacted).
+export function makeRepo(s, name, { branch = "main", parent = s.root, origin } = {}) {
   const dir = path.join(parent, name);
   fs.mkdirSync(dir, { recursive: true });
   s.git(dir, "init", "-q", "-b", branch);
   fs.writeFileSync(path.join(dir, ".gitkeep"), "");
   s.git(dir, "add", "--", ".gitkeep");
   s.git(dir, "commit", "-q", "-m", "chore: init");
+  if (origin) s.git(dir, "remote", "add", "origin", origin);
   return dir;
 }
 
@@ -120,8 +133,8 @@ export function commitFile(s, dir, file, content, message) {
 }
 
 // S/acme with a base commit recorded in S/acme.handoff/base and two commits after it.
-export function makeUiRepo(s, name = "acme") {
-  const dir = makeRepo(s, name);
+export function makeUiRepo(s, name = "acme", opts = {}) {
+  const dir = makeRepo(s, name, opts);
   fs.mkdirSync(`${dir}.handoff`, { recursive: true });
   fs.writeFileSync(path.join(`${dir}.handoff`, "base"), `${s.git(dir, "rev-parse", "HEAD")}\n`);
   commitFile(s, dir, "src/app/page.tsx", "export const Page = () => null;\n", "feat: page");
@@ -129,15 +142,57 @@ export function makeUiRepo(s, name = "acme") {
   return dir;
 }
 
-// A scratch HARNESS_DIR: settings.json (the repo's, or `settings`), .env with a key, optional recipes.
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Polls `check` until it returns something truthy, which it returns; throws after `ms`.
+export async function until(check, { ms = 15_000, step = 50, what = "a condition" } = {}) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() >= end) throw new Error(`gave up after ${ms} ms waiting for ${what}`);
+    await sleep(step);
+  }
+}
+
+const eventNames = (folder) => {
+  try {
+    return fs.readdirSync(folder).filter((name) => EVENT_NAME.test(name)).sort();
+  } catch {
+    return [];
+  }
+};
+
+// "Drained": the outbox holds no *.json and no .lock (a missing outbox counts); waits up to `ms`.
+export async function drained(h, ms = 15_000) {
+  const left = () => {
+    try {
+      return fs.readdirSync(h.outboxDir).filter((name) => name.endsWith(".json") || name === ".lock");
+    } catch {
+      return [];
+    }
+  };
+  try {
+    await until(() => left().length === 0, { ms, what: "the outbox to drain" });
+  } catch {
+    throw new Error(`the outbox did not drain within ${ms} ms; left: ${left().join(", ")}`);
+  }
+}
+
+// A scratch HARNESS_DIR: settings.json (the repo's, or `settings`), .env with a key (or the text `env`),
+// optional recipes. `events()` are the session-log events that bin/decide and the hooks queued in its
+// logs/session-outbox/, oldest first.
 export function makeHarness(s, { key = "test-key", env, settings } = {}) {
   const dir = s.dir("h");
   const settingsPath = path.join(dir, "settings.json");
-  const logFile = path.join(dir, "logs", "decisions.jsonl");
+  const outboxDir = path.join(dir, "logs", "session-outbox");
   const h = {
     dir,
     settingsPath,
-    logFile,
+    // bin/decide writes no decision log any more: tests assert this file stays absent.
+    logFile: path.join(dir, "logs", "decisions.jsonl"),
+    outboxDir,
+    rejectedDir: path.join(outboxDir, "rejected"),
     settings: () => readJson(settingsPath),
     edit(fn) {
       const doc = h.settings();
@@ -145,14 +200,10 @@ export function makeHarness(s, { key = "test-key", env, settings } = {}) {
       fs.writeFileSync(settingsPath, canonical(next));
       return next;
     },
-    logLines() {
-      try {
-        return fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean);
-      } catch {
-        return [];
-      }
-    },
-    log: () => h.logLines().map((line) => JSON.parse(line)),
+    setEnv: (text) => fs.writeFileSync(path.join(dir, ".env"), text),
+    eventFiles: () => eventNames(outboxDir),
+    events: () => eventNames(outboxDir).map((name) => readJson(path.join(outboxDir, name))),
+    rejectedFiles: () => eventNames(path.join(outboxDir, "rejected")),
     cacheFiles() {
       try {
         return fs.readdirSync(path.join(dir, "logs", "decisions")).sort();
@@ -177,6 +228,17 @@ export function makeHarness(s, { key = "test-key", env, settings } = {}) {
 export function decide(s, h, args, { url, env, cwd, timeoutMs } = {}) {
   if (!url || !/^http:\/\/127\.0\.0\.1:\d+$/.test(url)) throw new Error("decide(): pass a loopback url (the fake Jev or a closed port)");
   return run(DECIDE, args, { env: s.env({ HARNESS_DIR: h.dir, TYPESAFE_BASE_URL: url, ...env }), cwd: cwd ?? s.root, timeoutMs });
+}
+
+// The .env lines that turn the session log on: a loopback URL (a fake Supabase or a closed port), never the real project.
+export function supabaseEnv(url, secret = SECRET) {
+  if (!url || !/^http:\/\/127\.0\.0\.1:\d+$/.test(url)) throw new Error("supabaseEnv(): pass a loopback url (the fake Supabase or a closed port)");
+  return `COCKPIT_SUPABASE_URL=${url}\nCOCKPIT_SUPABASE_SECRET_KEY=${secret}\n`;
+}
+
+// Runs bin/session-log against a scratch harness, with its own HARNESS_DIR and the explicit scratch environment.
+export function sessionLog(s, h, args, { env, input, cwd, timeoutMs } = {}) {
+  return run(SESSION_LOG, args, { env: s.env({ HARNESS_DIR: h.dir, ...env }), cwd: cwd ?? s.root, input, timeoutMs });
 }
 
 // ---------- JSON Schema ----------
