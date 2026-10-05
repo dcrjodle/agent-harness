@@ -34,7 +34,7 @@ merge_hooks() {
   local tmp; tmp="$(mktemp)"
   jq --arg ctx 'f="$HOME/.agent-harness/hooks/session-context.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg guard 'f="$HOME/.agent-harness/hooks/guard.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
-     --arg log 'f="$HOME/.agent-harness/hooks/stage-log.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
+     --arg log 'f="$HOME/.agent-harness/hooks/session-log.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg decide 'f="$HOME/.agent-harness/hooks/decide-context.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg matcher "$guard_matcher" --argjson claude "$claude" '
     def harness: (.command // "") | contains(".agent-harness/hooks/");
@@ -47,8 +47,10 @@ merge_hooks() {
     | if $claude then
         add("PreToolUse"; {matcher: "Skill", hooks: [run($decide) + {timeout: 30}]})
         | add("UserPromptExpansion"; {matcher: "solve", hooks: [run($decide) + {timeout: 30}]})
-        | add("SubagentStart"; {hooks: [run($log)]})
-        | add("SubagentStop"; {hooks: [run($log)]})
+        | add("SubagentStart"; {hooks: [run($log) + {timeout: 10}]})
+        | add("SubagentStop"; {hooks: [run($log) + {timeout: 10}]})
+        | add("PostToolUse"; {matcher: "Agent", hooks: [run($log) + {timeout: 10}]})
+        | add("SessionEnd"; {hooks: [run($log) + {timeout: 5}]})
       else . end
   ' "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp" && echo "hooks merged into $file (backup: $file.pre-harness)" \
     || { echo "hook merge failed for $file" >&2; rm -f "$tmp"; return 1; }
@@ -76,7 +78,7 @@ ln -sfn "$PWD" "$HARNESS"
 mkdir -p cache/recipes logs
 chmod +x bin/* hooks/*.sh
 node -e 'process.exit(typeof require("node:util").parseEnv === "function" ? 0 : 1)' 2>/dev/null \
-  || echo "warning: bin/decide (level, recipe and ui decisions) needs Node 20.12 or later on PATH"
+  || echo "warning: bin/decide (level, recipe and ui decisions) and bin/session-log (the session log) need Node 20.12 or later on PATH"
 
 # Claude Code — roles, skills, hooks, CLAUDE.md import
 mkdir -p "$HOME/.claude/agents" "$HOME/.claude/skills" "$HOME/.claude/commands"
@@ -98,4 +100,4 @@ echo "codex: approve the new hooks when Codex asks you to trust them."
 
 echo "cursor: add a User Rule in Cursor settings: 'Read ~/.agent-harness/AGENTS.md and follow it exactly.'"
 echo "cursor: per repo, run ./setup.sh --project <repo-path> to link the rule + skills as commands."
-echo "harness linked at $HARNESS — edit .env (TYPESAFE_API_KEY lets decisions ask Jev) and MACHINE.md"
+echo "harness linked at $HARNESS — edit .env (TYPESAFE_API_KEY lets decisions ask Jev; COCKPIT_SUPABASE_URL and COCKPIT_SUPABASE_SECRET_KEY turn on the session log) and MACHINE.md"
