@@ -97,7 +97,7 @@ describe("R2 the session-log lock", () => {
         const { fake, h, full } = await setup(t, { secret: false });
         await queueAgents(h, ["a1", "a2", "a3", "a4", "a5", "a6"]);
         full();
-        fake.mode("delay:400");
+        fake.mode("delay:800");
         const holder = startFlush(t, h);
         await firstRequest(fake);
         const lock = lockOf(h);
@@ -118,8 +118,8 @@ describe("R2 the session-log lock", () => {
       const { fake, h, full } = await setup(t, { secret: false });
       await queueAgents(h, ["a1", "a2", "a3"]);
       full();
-      fake.queue(["delay:1200"]); // the sleeper's first request is slow, as if the machine slept in it
-      fake.mode("delay:250"); // the new holder's requests take a while too, so it is still sending when the sleeper wakes
+      fake.queue(["delay:2200"]); // the sleeper's first request is slow, as if the machine slept in it
+      fake.mode("delay:400"); // the new holder's requests take a while too, so it is still sending when the sleeper wakes
       const sleeper = startFlush(t, h);
       await firstRequest(fake);
       const lock = lockOf(h);
@@ -146,7 +146,7 @@ describe("R2 the session-log lock", () => {
     const { fake, h, full } = await setup(t, { secret: false });
     await queueAgents(h, ["a1", "a2"]);
     full();
-    fake.queue(["delay:500"]);
+    fake.queue(["delay:800"]);
     fake.mode("delay:300");
     const holder = startFlush(t, h);
     await firstRequest(fake);

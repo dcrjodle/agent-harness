@@ -25,7 +25,7 @@ describe("R2 bin/session-log fixes", () => {
 
   describe("the label event creates a missing row and never touches an existing one (verify-1 G2)", () => {
     for (const tool of ["Agent", "Task"]) {
-      it(`a ${tool} spawn's label alone creates the agent's row from its subagent_type: running, open, labelled`, async (t) => {
+      it(`${tool === "Agent" ? "an" : "a"} ${tool} spawn's label alone creates the agent's row from its subagent_type: running, open, labelled`, async (t) => {
         const { fake, h, full } = await setup(t, { secret: false });
         quiet(await hook(h, launched("r1", "Lane 1", "implementer", { tool_name: tool })));
         const [event] = h.events();
@@ -128,6 +128,7 @@ describe("R2 bin/session-log fixes", () => {
     };
 
     describe("hooks run one after the other, in a shuffled order", { concurrency: 3 }, () => {
+      // Two fixed seeds and a random one; a failure message names the seed and the order, which replay it.
       for (const seed of [7, 1991, Math.floor(Math.random() * 2 ** 31)]) {
         it(`seed ${seed}`, async (t) => {
           const { fake, h, full } = await setup(t, { secret: false });
