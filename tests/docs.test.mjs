@@ -148,6 +148,16 @@ describe("H-F the session log is documented and the public repo is clean", () =>
       }
     });
 
+    // What the review fixes made true (tested in session-log-fixes.test.mjs), so that the README keeps saying it.
+    it("the Session log section says the key goes over https only, how many events wait or are kept, and that flush says why on stderr", () => {
+      const text = section(read("README.md"), "Session log").replace(/\s+/g, " ");
+      assert.match(text, /only sent over `https`[^.]*loopback/, "https only, plain http to a loopback host");
+      assert.match(text, /rejected\/[^.]*newest 1,000/, "rejected/ keeps the newest 1,000");
+      assert.match(text, /at most 10,000/, "the 10,000 cap on waiting events");
+      assert.match(text, /`bin\/session-log flush`[^.]*why on stderr/, "flush says why on stderr");
+      assert.doesNotMatch(read("README.md"), /can write/i, "status shows whether the keys are set, not whether the log can write");
+    });
+
     it("AGENTS.md and the solve skill both mention session-log", () => {
       for (const file of ["AGENTS.md", "skills/solve/SKILL.md"]) assert.ok(read(file).includes("session-log"), file);
     });
