@@ -2,4 +2,4 @@
 description: Agent harness contract
 alwaysApply: true
 ---
-Read ~/.agent-harness/AGENTS.md and follow it exactly: rules/, agents/ (run roles inline), skills/solve, cache/recipes/.
+Read ~/.agent-harness/AGENTS.md and follow it exactly: rules/, agents/ (run roles inline; a role file's model: haiku → cheapest, sonnet → default, opus or fable → strongest, inherit → this session's), skills/solve (its first step runs ~/.agent-harness/bin/decide start once), cache/recipes/. Cursor sessions are not logged: the session log needs Claude Code hooks.

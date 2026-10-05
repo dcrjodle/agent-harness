@@ -1,0 +1,637 @@
+#!/usr/bin/env node
+// session-log: the orchestrating Claude Code session's log in Supabase, in three tables written over
+// PostgREST: cockpit_sessions (the session), cockpit_agents (each sub-agent it spawns) and
+// cockpit_decisions (bin/decide's decisions). Hooks and bin/decide queue events in
+// logs/session-outbox/, one file each; one flusher at a time sends them in name order and deletes each
+// once its writes succeed. Writes are idempotent upserts and updates, so a retry is safe.
+// Never blocks work: `hook` always exits 0, quickly and silently, and a failed write keeps the events
+// for the next flush. Dir: $HARNESS_DIR or this script's repo. Keys: COCKPIT_SUPABASE_URL and
+// COCKPIT_SUPABASE_SECRET_KEY from <dir>/.env only; the process environment is ignored and no value
+// is ever printed. Without them the events wait.
+"use strict";
+
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const tty = require("node:tty");
+const util = require("node:util");
+const { execFileSync, spawn } = require("node:child_process");
+
+const USAGE = `usage:
+  session-log hook     queue the event of a Claude Code hook payload (stdin) and flush in the background
+  session-log flush    send the waiting events now: "sent N, waiting M, rejected R"; on stderr,
+                       "stopped: <why>" when events still wait
+  session-log status   whether the Supabase keys are set and usable; the waiting and rejected events
+`;
+
+const SCRIPT_ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
+const DIR = process.env.HARNESS_DIR ? path.resolve(process.env.HARNESS_DIR) : SCRIPT_ROOT;
+const OUTBOX = path.join(DIR, "logs", "session-outbox");
+const REJECTED = path.join(OUTBOX, "rejected");
+const LOCK = path.join(OUTBOX, ".lock");
+const EVENT_FILE = /^\d{13}-\d+-\d{4}\.json$/;
+const STRAY_FILE = /^\.(?:\d{13}-\d+-\d{4}\.json\.tmp|lock\.\d+-[0-9a-f]{16})$/;
+const MAX_WAITING = 10000;
+const MAX_REJECTED = 1000;
+const STRAY_STALE_MS = 60000;
+const REQUEST_TIMEOUT_MS = 3000;
+const RUN_MS = 25000;
+const LOCK_STALE_MS = 60000;
+const LOCK_POLL_MS = 100;
+const LOCK_TOKEN = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+const LOOPBACK = /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/;
+const BAD_URL = "invalid COCKPIT_SUPABASE_URL (https, or http on loopback only)";
+const ID = /^[A-Za-z0-9_-]{1,128}$/;
+const LEVEL = /^[a-z][a-z0-9-]{0,23}$/;
+const POINTS = ["level", "recipe", "ui"];
+const SOURCES = ["jev", "cache", "fallback", "override"];
+const LIMIT = { title: 200, label: 120, repo: 200, role: 100, value: 120 };
+const KINDS = ["session", "agent_start", "agent_label", "agent_stop", "decision", "session_end"];
+
+const isId = (v) => typeof v === "string" && ID.test(v);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------- events ----------
+
+// Control characters that are not blanks dropped, then whitespace runs → one space, trimmed (in this
+// order, so clipping a clipped text changes nothing); over `limit` code points → the first limit − 1
+// and "…"; empty → null.
+function clip(value, limit) {
+  if (typeof value !== "string") return null;
+  const text = (value.toWellFormed ? value.toWellFormed() : value)
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return null;
+  const points = [...text];
+  return points.length > limit ? `${points.slice(0, limit - 1).join("")}…` : text;
+}
+
+const confidence = (x) => (typeof x === "number" && Number.isFinite(x) && x >= 0 && x <= 1 ? Math.round(x * 1e4) / 1e4 : null);
+
+// An outbox event, normalised: {v, kind, session_id, at, repo, ...the kind's fields}, or null when an id,
+// the level, the point, the source or a required text does not fit the tables.
+function makeEvent(kind, sessionId, fields = {}, at = new Date()) {
+  if (!isId(sessionId) || !(at instanceof Date) || Number.isNaN(at.getTime())) return null;
+  const e = { v: 1, kind, session_id: sessionId, at: at.toISOString(), repo: clip(fields.repo, LIMIT.repo) };
+  switch (kind) {
+    case "session": {
+      const level = fields.level ?? null;
+      if (level !== null && !(typeof level === "string" && LEVEL.test(level))) return null;
+      return { ...e, title: clip(fields.title, LIMIT.title), level };
+    }
+    case "agent_start": {
+      const role = clip(fields.role, LIMIT.role);
+      return isId(fields.agent_id) && role ? { ...e, agent_id: fields.agent_id, role, label: clip(fields.label, LIMIT.label) } : null;
+    }
+    case "agent_label": {
+      // `role` (the spawn's subagent_type, general-purpose when it names none): with it the label can create
+      // the agent's row. A label without one (queued by an earlier version) only labels a row that exists.
+      const label = clip(fields.label, LIMIT.label);
+      const role = clip(fields.role, LIMIT.role);
+      if (!isId(fields.agent_id) || !label) return null;
+      return role ? { ...e, agent_id: fields.agent_id, role, label } : { ...e, agent_id: fields.agent_id, label };
+    }
+    case "agent_stop":
+      return isId(fields.agent_id) ? { ...e, agent_id: fields.agent_id } : null;
+    case "decision": {
+      const value = clip(fields.value, LIMIT.value);
+      if (!POINTS.includes(fields.point) || !SOURCES.includes(fields.source) || !value) return null;
+      return { ...e, point: fields.point, value, confidence: confidence(fields.confidence), source: fields.source };
+    }
+    case "session_end":
+      return e;
+    default:
+      return null;
+  }
+}
+
+// An event read back from the outbox is sent only as makeEvent would have written it.
+function validEvent(e) {
+  if (!e || typeof e !== "object" || e.v !== 1 || !KINDS.includes(e.kind) || typeof e.at !== "string") return false;
+  const at = new Date(e.at);
+  if (Number.isNaN(at.getTime()) || at.toISOString() !== e.at) return false;
+  return JSON.stringify(makeEvent(e.kind, e.session_id, e, at)) === JSON.stringify(e);
+}
+
+function git(dir, args) {
+  try {
+    return execFileSync("git", ["--no-optional-locks", "-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// owner/name: the last two path parts of the origin remote's URL (".git" cut; the scheme and any user or
+// password before the host left out first), else the main checkout folder's name, else the folder's name.
+function repoOf(dir) {
+  if (typeof dir !== "string" || !dir) return null;
+  const url = git(dir, ["remote", "get-url", "origin"])
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/([^@/]*@)?/i, "")
+    .replace(/^[^@/:]*@/, "");
+  const parts = url.replace(/\.git$/, "").split(/[/:]+/).filter(Boolean);
+  if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+  const common = git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return path.basename(common ? path.dirname(common) : path.resolve(dir)) || null;
+}
+
+let seq = 0;
+
+// Queues events ({kind, session_id, at?, repo?, dir?, ...fields}; `dir` gives the repo) as
+// <at ms>-<pid>-<seq>.json, each written to a dot-file first and then renamed, and keeps at most
+// MAX_WAITING by deleting the oldest. Events that do not fit are dropped. → the number queued; never throws.
+function queue(events) {
+  const repos = new Map();
+  const ready = [];
+  for (const ev of events || []) {
+    if (!ev) continue;
+    let repo = ev.repo;
+    if (repo === undefined && ev.dir) {
+      if (!repos.has(ev.dir)) repos.set(ev.dir, repoOf(ev.dir));
+      repo = repos.get(ev.dir);
+    }
+    const e = makeEvent(ev.kind, ev.session_id, { ...ev, repo }, ev.at instanceof Date ? ev.at : new Date());
+    if (e) ready.push(e);
+  }
+  if (!ready.length) return 0;
+  try {
+    fs.mkdirSync(OUTBOX, { recursive: true, mode: 0o700 });
+  } catch {
+    return 0;
+  }
+  let queued = 0;
+  for (const e of ready) {
+    const name = `${String(Date.parse(e.at)).padStart(13, "0")}-${process.pid}-${String(seq++ % 10000).padStart(4, "0")}.json`;
+    const tmp = path.join(OUTBOX, `.${name}.tmp`);
+    try {
+      fs.writeFileSync(tmp, `${JSON.stringify(e)}\n`, { mode: 0o600 });
+      fs.renameSync(tmp, path.join(OUTBOX, name));
+      queued++;
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+  let entries = [];
+  try {
+    entries = fs.readdirSync(OUTBOX);
+  } catch {}
+  const names = entries.filter((name) => EVENT_FILE.test(name)).sort();
+  for (const name of names.slice(0, Math.max(0, names.length - MAX_WAITING))) {
+    try {
+      fs.unlinkSync(path.join(OUTBOX, name));
+    } catch {}
+  }
+  // A writer killed between its write and its rename leaves its dot-file behind, a flusher killed while
+  // taking a stale lock over leaves the lock it moved aside: a file, or a folder (the earlier version's
+  // lock), removed as takeOver removes it (a symlink itself, never what it points to).
+  for (const name of entries.filter((entry) => STRAY_FILE.test(entry))) {
+    const file = path.join(OUTBOX, name);
+    try {
+      if (Date.now() - fs.lstatSync(file).mtimeMs > STRAY_STALE_MS) fs.rmSync(file, { recursive: true, force: true });
+    } catch {}
+  }
+  return queued;
+}
+
+// Event file names in a folder, oldest first.
+function listEvents(folder) {
+  try {
+    return fs.readdirSync(folder).filter((name) => EVENT_FILE.test(name)).sort();
+  } catch {
+    return [];
+  }
+}
+const waiting = () => listEvents(OUTBOX);
+
+// ---------- keys ----------
+
+// The key travels only over https; plain http is for a loopback host (tests).
+function safeUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK.test(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
+// Why nothing can be sent ("missing …" or BAD_URL), or null when the keys are usable.
+function problem(cred) {
+  if (cred.missing.length) return `missing ${cred.missing.join(", ")}`;
+  return cred.invalid ? BAD_URL : null;
+}
+
+// The Supabase URL and secret key from <dir>/.env only; `missing` names the absent ones, `invalid` says
+// the URL is set but not safe to send the key to.
+function credentials() {
+  let env = {};
+  try {
+    if (typeof util.parseEnv === "function") env = util.parseEnv(fs.readFileSync(path.join(DIR, ".env"), "utf8"));
+  } catch {}
+  const value = (name) => (typeof env[name] === "string" ? env[name].trim() : "");
+  const url = value("COCKPIT_SUPABASE_URL");
+  const key = value("COCKPIT_SUPABASE_SECRET_KEY");
+  const missing = [];
+  if (!url) missing.push("COCKPIT_SUPABASE_URL");
+  if (!key) missing.push("COCKPIT_SUPABASE_SECRET_KEY");
+  return { base: `${url.replace(/\/+$/, "")}/rest/v1`, key, missing, invalid: Boolean(url) && !safeUrl(url) };
+}
+
+// ---------- writes ----------
+
+// One event's requests, in order. U (create the session row, ignored when it exists) goes first, once
+// per session per flush run, for the events that may create a row: session, agent_start, decision and an
+// agent_label with a role.
+function requests(e, ensured) {
+  const sid = e.session_id;
+  const touch = (body) => ({ method: "PATCH", path: `cockpit_sessions?id=eq.${sid}`, body });
+  const ensure = (title = null, level = null) =>
+    ensured.has(sid)
+      ? []
+      : [
+          {
+            method: "POST",
+            path: "cockpit_sessions?on_conflict=id",
+            prefer: "resolution=ignore-duplicates, return=minimal",
+            body: { id: sid, repo: e.repo, title, level, started_at: e.at, last_at: e.at, ended_at: null },
+            ensures: sid,
+          },
+        ];
+  const upsert = (table, conflict, body) => ({
+    method: "POST",
+    path: `${table}?on_conflict=${conflict}`,
+    prefer: "resolution=merge-duplicates, return=minimal",
+    body,
+  });
+  switch (e.kind) {
+    case "session":
+      return [...ensure(e.title, e.level), touch({ last_at: e.at, title: e.title, level: e.level, ended_at: null })];
+    case "agent_start": {
+      const agent = { id: e.agent_id, session_id: sid, role: e.role, started_at: e.at, ended_at: null, status: "running" };
+      if (e.label !== null) agent.label = e.label;
+      return [...ensure(), upsert("cockpit_agents", "id", agent), touch({ last_at: e.at, ended_at: null })];
+    }
+    case "agent_label": {
+      // SubagentStart and the PostToolUse of a background spawn fire together, so the label can come
+      // before the agent's start. With the role it creates the row when it is missing (an existing row
+      // stays as it is), then sets the label; agent_start never sends a null label, so it cannot clear it.
+      const setLabel = { method: "PATCH", path: `cockpit_agents?id=eq.${e.agent_id}`, body: { label: e.label } };
+      if (!e.role) return [setLabel, touch({ last_at: e.at })];
+      const agent = { id: e.agent_id, session_id: sid, role: e.role, started_at: e.at, ended_at: null, status: "running" };
+      const create = { method: "POST", path: "cockpit_agents?on_conflict=id", prefer: "resolution=ignore-duplicates, return=minimal", body: agent };
+      return [...ensure(), create, setLabel, touch({ last_at: e.at })];
+    }
+    case "agent_stop":
+      return [{ method: "PATCH", path: `cockpit_agents?id=eq.${e.agent_id}`, body: { ended_at: e.at, status: "done" } }, touch({ last_at: e.at })];
+    case "decision": {
+      const decision = { session_id: sid, point: e.point, value: e.value, confidence: e.confidence, source: e.source, at: e.at };
+      return [...ensure(), upsert("cockpit_decisions", "session_id,point,at", decision), touch({ last_at: e.at, ended_at: null })];
+    }
+    case "session_end":
+      return [
+        { method: "PATCH", path: `cockpit_agents?session_id=eq.${sid}&status=eq.running`, body: { status: "failed", ended_at: e.at } },
+        touch({ last_at: e.at, ended_at: e.at }),
+      ];
+    default:
+      return [];
+  }
+}
+
+// One request within REQUEST_TIMEOUT_MS. The key goes on apikey (Bearer too only for a legacy JWT key).
+// → {} on 2xx | { reject } on 400, 409 or 422 (the event can never be written) | { stop } otherwise.
+async function send(cred, req) {
+  const headers = { apikey: cred.key, "Content-Type": "application/json", Accept: "application/json", "User-Agent": "agent-harness-session-log/1" };
+  if (cred.key.startsWith("eyJ")) headers.Authorization = `Bearer ${cred.key}`;
+  headers.Prefer = req.prefer || "return=minimal";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${cred.base}/${req.path}`, {
+      method: req.method,
+      headers,
+      body: JSON.stringify(req.body),
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (res.status >= 200 && res.status < 300) {
+      res.body?.cancel().catch(() => {});
+      return {};
+    }
+    if (res.status !== 400 && res.status !== 409 && res.status !== 422) {
+      res.body?.cancel().catch(() => {});
+      return { stop: `http-${res.status}` };
+    }
+    let code = null;
+    let message = null;
+    try {
+      const answer = JSON.parse(await res.text());
+      if (typeof answer.code === "string") code = answer.code;
+      if (typeof answer.message === "string") message = answer.message.slice(0, 500);
+    } catch {}
+    return { reject: `${res.status} ${code || "-"} ${message || "-"} (${req.method} /rest/v1/${req.path})` };
+  } catch {
+    return { stop: controller.signal.aborted ? "timeout" : "network" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Moves an event that can never be written to rejected/, with the reason beside it, and keeps only the
+// newest MAX_REJECTED there (a refusal that repeats for every event must not fill the disk).
+function reject(name, reason) {
+  try {
+    fs.mkdirSync(REJECTED, { recursive: true, mode: 0o700 });
+    fs.renameSync(path.join(OUTBOX, name), path.join(REJECTED, name));
+    fs.writeFileSync(path.join(REJECTED, `${name}.reason`), `${reason}\n`, { mode: 0o600 });
+  } catch {}
+  const names = listEvents(REJECTED);
+  for (const old of names.slice(0, Math.max(0, names.length - MAX_REJECTED))) {
+    for (const file of [old, `${old}.reason`]) {
+      try {
+        fs.unlinkSync(path.join(REJECTED, file));
+      } catch {}
+    }
+  }
+  return "rejected";
+}
+
+// → "sent" | "rejected" | "gone" (deleted meanwhile) | { stop: why } (keep it and every later event)
+async function sendEvent(cred, name, ensured) {
+  let e;
+  try {
+    e = JSON.parse(fs.readFileSync(path.join(OUTBOX, name), "utf8"));
+  } catch (err) {
+    return err && err.code === "ENOENT" ? "gone" : reject(name, "invalid event: not JSON");
+  }
+  if (!validEvent(e)) return reject(name, "invalid event");
+  for (const req of requests(e, ensured)) {
+    if (!holdLock()) return { stop: "another flush took the lock over" };
+    const r = await send(cred, req);
+    if (r.stop) return { stop: r.stop };
+    if (r.reject) return reject(name, r.reject);
+    if (req.ensures) ensured.add(req.ensures);
+  }
+  try {
+    fs.unlinkSync(path.join(OUTBOX, name));
+  } catch {}
+  return "sent";
+}
+
+// ---------- flush ----------
+
+// One flusher at a time. The lock is the file .lock holding its flusher's LOCK_TOKEN. The holder checks
+// that the lock is still its own, and refreshes its time, before every request, and stops once it is not.
+// A lock untouched for LOCK_STALE_MS (its flusher died, or the machine slept) is taken over. A second
+// flusher waits up to RUN_MS, and gives up as soon as nothing waits (the holder sends it all). Each pass
+// either sleeps or removes a stale lock, so waiting never spins. → "" once held, else why not.
+async function lock() {
+  const until = Date.now() + RUN_MS;
+  for (;;) {
+    try {
+      fs.writeFileSync(LOCK, LOCK_TOKEN, { flag: "wx", mode: 0o600 });
+      return "";
+    } catch (err) {
+      if (!err || err.code !== "EEXIST") return `the lock cannot be made (${(err && err.code) || "error"})`;
+    }
+    const tookOver = takeOver();
+    if (Date.now() >= until || waiting().length === 0) return "another flush holds the lock";
+    if (!tookOver) await sleep(LOCK_POLL_MS);
+  }
+}
+
+// Removes a stale lock: it is first moved aside under this flusher's own name, which only one taker can
+// do. A lock that turns out to be fresh (taken between the look and the move) is put back, never over a
+// newer one; if that fails, its holder sees the lock is gone and stops. → true when a lock was moved.
+function takeOver() {
+  try {
+    if (Date.now() - fs.lstatSync(LOCK).mtimeMs <= LOCK_STALE_MS) return false;
+  } catch {
+    return false;
+  }
+  const aside = `${LOCK}.${LOCK_TOKEN}`;
+  try {
+    fs.renameSync(LOCK, aside);
+  } catch {
+    return false;
+  }
+  try {
+    const moved = fs.lstatSync(aside);
+    if (Date.now() - moved.mtimeMs <= LOCK_STALE_MS) {
+      if (moved.isDirectory()) fs.renameSync(aside, LOCK);
+      else fs.linkSync(aside, LOCK);
+    }
+  } catch {}
+  try {
+    fs.rmSync(aside, { recursive: true, force: true });
+  } catch {}
+  return true;
+}
+
+// True while the lock is this flusher's; its time is refreshed then, so it never looks stale while held.
+function holdLock() {
+  try {
+    if (fs.readFileSync(LOCK, "utf8") !== LOCK_TOKEN) return false;
+    const now = new Date();
+    fs.utimesSync(LOCK, now, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Removes the lock only when it is this flusher's.
+function unlock() {
+  try {
+    if (fs.readFileSync(LOCK, "utf8") === LOCK_TOKEN) fs.unlinkSync(LOCK);
+  } catch {}
+}
+
+// Sends the waiting events in name order until none is left, a write fails or RUN_MS have passed.
+// → { out: "sent N, waiting M, rejected R", why: why events still wait, or null }
+async function flush() {
+  const cred = credentials();
+  let sent = 0;
+  let rejected = 0;
+  let why = problem(cred);
+  if (!why && waiting().length) why = await lock();
+  if (why === "") {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, () => (unlock(), process.exit(1)));
+    const ensured = new Set();
+    const tried = new Set();
+    const deadline = Date.now() + RUN_MS;
+    try {
+      run: for (;;) {
+        const names = waiting().filter((name) => !tried.has(name));
+        if (!names.length) break;
+        for (const name of names) {
+          if (Date.now() >= deadline) {
+            why = `this run used its ${RUN_MS / 1000} s`;
+            break run;
+          }
+          tried.add(name);
+          const r = await sendEvent(cred, name, ensured);
+          if (r.stop) {
+            why = `${r.stop} (${name})`;
+            break run;
+          }
+          if (r === "sent") sent++;
+          if (r === "rejected") rejected++;
+        }
+      }
+    } finally {
+      unlock();
+    }
+  }
+  const left = waiting().length;
+  return { out: `sent ${sent}, waiting ${left}, rejected ${rejected}`, why: left ? why : null };
+}
+
+// Starts `flush` detached, unless the keys are missing or the URL is not safe. Never throws.
+function flushInBackground() {
+  if (problem(credentials())) return false;
+  try {
+    const child = spawn(process.execPath, [__filename, "flush"], {
+      cwd: DIR,
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, HARNESS_DIR: DIR },
+    });
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------- hooks ----------
+
+// The agent's description from <transcript minus .jsonl>/subagents/agent-<id>.meta.json, when it is there.
+function metaLabel(transcript, agentId) {
+  if (typeof transcript !== "string" || !transcript.endsWith(".jsonl") || !isId(agentId)) return null;
+  const base = transcript.startsWith("~/") ? path.join(os.homedir(), transcript.slice(2)) : transcript;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(base.slice(0, -6), "subagents", `agent-${agentId}.meta.json`), "utf8"));
+    return meta && typeof meta.description === "string" ? meta.description : null;
+  } catch {
+    return null;
+  }
+}
+
+// A hook payload → the event it stands for, or null.
+//   SubagentStart → agent_start          SubagentStop → agent_stop          SessionEnd → session_end
+//   PostToolUse of the Agent tool, in the main session → agent_label (the description, and the
+//   subagent_type as the role so the label can create the row; a spawn that names none is a
+//   general-purpose agent, which SubagentStart reports as its agent_type, and agent_start sets the
+//   role it reports anyway)
+// The label comes from the PostToolUse: the agent's meta file, read at SubagentStart, is rarely written yet.
+// SubagentStop with an empty agent_type is one of the engine's own side agents, not a spawned one.
+function hookEvent(p) {
+  if (!p || typeof p !== "object" || Array.isArray(p) || !isId(p.session_id)) return null;
+  let e = null;
+  switch (p.hook_event_name) {
+    case "SubagentStart":
+      e = makeEvent("agent_start", p.session_id, { agent_id: p.agent_id, role: p.agent_type, label: metaLabel(p.transcript_path, p.agent_id) });
+      break;
+    case "PostToolUse":
+      if (p.agent_id || (p.tool_name !== "Agent" && p.tool_name !== "Task")) return null;
+      e = makeEvent("agent_label", p.session_id, {
+        agent_id: p.tool_response?.agentId,
+        role: p.tool_input?.subagent_type || "general-purpose",
+        label: p.tool_input?.description,
+      });
+      break;
+    case "SubagentStop":
+      if (typeof p.agent_type !== "string" || !p.agent_type) return null;
+      e = makeEvent("agent_stop", p.session_id, { agent_id: p.agent_id });
+      break;
+    case "SessionEnd":
+      e = makeEvent("session_end", p.session_id);
+      break;
+  }
+  if (e && typeof p.cwd === "string" && p.cwd) e.repo = clip(repoOf(p.cwd), LIMIT.repo);
+  return e;
+}
+
+// The hook payload: all of stdin, read as a stream when stdin is non-blocking; "" from a terminal.
+function readStdin() {
+  if (tty.isatty(0)) return Promise.resolve("");
+  try {
+    return Promise.resolve(fs.readFileSync(0, "utf8"));
+  } catch (err) {
+    if (!err || err.code !== "EAGAIN") return Promise.resolve("");
+  }
+  return new Promise((resolve) => {
+    let text = "";
+    const timer = setTimeout(() => resolve(""), 2000);
+    const done = (value) => (clearTimeout(timer), resolve(value));
+    process.stdin
+      .setEncoding("utf8")
+      .on("data", (d) => (text += d))
+      .on("end", () => done(text))
+      .on("error", () => done(""));
+  });
+}
+
+async function hook() {
+  let payload;
+  try {
+    payload = JSON.parse(await readStdin());
+  } catch {
+    return;
+  }
+  const e = hookEvent(payload);
+  if (e && queue([e])) flushInBackground();
+}
+
+function status() {
+  return [
+    `supabase: ${problem(credentials()) || "set"}`,
+    `waiting: ${waiting().length}`,
+    `rejected: ${listEvents(REJECTED).length}`,
+    "",
+  ].join("\n");
+}
+
+async function main([cmd]) {
+  switch (cmd) {
+    case "hook":
+      try {
+        await hook();
+      } catch {}
+      return { code: 0 };
+    case "flush": {
+      const r = await flush();
+      return { code: 0, out: `${r.out}\n`, err: r.why ? `stopped: ${r.why}\n` : "" };
+    }
+    case "status":
+      return { code: 0, out: status() };
+    case "-h":
+    case "--help":
+      return { code: 0, out: USAGE };
+    case undefined:
+      return { code: 2, err: `session-log: no command\n${USAGE}` };
+    default:
+      return { code: 2, err: `session-log: unknown command "${cmd}"\n${USAGE}` };
+  }
+}
+
+module.exports = { queue, flushInBackground, repoOf };
+
+if (require.main === module) {
+  const finish = (code, out, err) => {
+    try {
+      if (err) fs.writeSync(2, err);
+      if (out) fs.writeSync(1, out);
+    } catch {}
+    process.exit(code);
+  };
+  const quiet = process.argv[2] === "hook";
+  main(process.argv.slice(2)).then(
+    (r) => finish(r.code, r.out, r.err),
+    (e) => (quiet ? finish(0) : finish(2, "", `session-log: ${(e && e.stack) || e}\n`)),
+  );
+}

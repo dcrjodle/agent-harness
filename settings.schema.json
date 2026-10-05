@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent harness settings",
+  "description": "settings.json at the harness root, version 1: the levels of the solve loop, least to most thorough, and the Jev decisions made by bin/decide. Level ids are unique (uniqueItemProperties, as in ajv-keywords); cross-field rules use if/then. Canonical bytes: JSON.stringify(doc, null, 2) plus a newline.",
+  "type": "object",
+  "required": [
+    "version",
+    "levels",
+    "decisions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "const": "./settings.schema.json"
+    },
+    "version": {
+      "const": 1
+    },
+    "levels": {
+      "description": "1 to 5 levels, least to most thorough. Each description says which tasks belong to the level; Jev picks the level against these descriptions.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItemProperties": [
+        "id"
+      ],
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "description",
+          "stages"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Unique level id. inline, loop and none are reserved.",
+            "type": "string",
+            "pattern": "^(?!(?:inline|loop|none)$)[a-z][a-z0-9-]{0,23}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 24
+          },
+          "description": {
+            "description": "Which tasks belong to this level; also the criterion Jev classifies tasks against.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "stages": {
+            "type": "object",
+            "required": [
+              "plan",
+              "implement",
+              "test",
+              "verify",
+              "design",
+              "review",
+              "fixRounds"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "plan": {
+                "description": "true: the planner writes plan.md and checks.md. false: the orchestrator writes checks.md.",
+                "type": "boolean"
+              },
+              "implement": {
+                "description": "self: the orchestrator writes the code in the task worktree. agents: it only orchestrates; lane 0 first, then the other lanes in parallel forks.",
+                "enum": [
+                  "self",
+                  "agents"
+                ]
+              },
+              "test": {
+                "description": "true: a tester agent writes and runs the tests. false: the orchestrator runs and adds tests itself.",
+                "type": "boolean"
+              },
+              "verify": {
+                "description": "off: no verifier. ui: a verifier runs the app when the ui decision says the task changed a UI. always: a verifier always runs.",
+                "enum": [
+                  "off",
+                  "ui",
+                  "always"
+                ]
+              },
+              "design": {
+                "description": "ui: a designer compares the screenshots with the design reference named in checks.md when the ui decision says yes. off: the orchestrator judges the screenshots.",
+                "enum": [
+                  "off",
+                  "ui"
+                ]
+              },
+              "review": {
+                "description": "true: a reviewer agent reviews the diff.",
+                "type": "boolean"
+              },
+              "fixRounds": {
+                "description": "Most fix rounds after the first check round.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              }
+            },
+            "if": {
+              "required": [
+                "implement"
+              ],
+              "properties": {
+                "implement": {
+                  "const": "agents"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "plan": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        "if": {
+          "required": [
+            "stages"
+          ],
+          "properties": {
+            "stages": {
+              "required": [
+                "design"
+              ],
+              "properties": {
+                "design": {
+                  "const": "ui"
+                }
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "stages": {
+              "properties": {
+                "verify": {
+                  "enum": [
+                    "ui",
+                    "always"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "decisions": {
+      "description": "Jev decisions made by bin/decide: the pinned model, the time budget per decision and the three decision points with their fixed wording.",
+      "type": "object",
+      "required": [
+        "model",
+        "timeoutMs",
+        "points"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "description": "Pinned Jev model.",
+          "type": "string",
+          "pattern": "^jev-\\d+\\.\\d+\\.\\d+$"
+        },
+        "timeoutMs": {
+          "description": "Time budget per decision in milliseconds, one retry included.",
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 20000
+        },
+        "points": {
+          "type": "object",
+          "required": [
+            "level",
+            "recipe",
+            "ui"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "level": {
+              "description": "Once at the start of every solve: the task text picks a level; the criteria are the level descriptions. Skipped when the task's first word names a level (inline: the first level, loop: the last). Fallback: the more thorough of the top two.",
+              "type": "object",
+              "required": [
+                "enabled",
+                "minConfidence",
+                "question"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "description": "false: bin/decide skips Jev and uses the point's fallback.",
+                  "type": "boolean"
+                },
+                "minConfidence": {
+                  "description": "Below this confidence bin/decide uses the point's fallback. Confidence is (n * pmax - 1) / (n - 1) over n options.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "question": {
+                  "description": "Fixed wording sent to Jev.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                }
+              }
+            },
+            "recipe": {
+              "description": "Once at the start of a solve, only when the repo has cached recipes: the task text picks one recipe or none. Fallback: none.",
+              "type": "object",
+              "required": [
+                "enabled",
+                "minConfidence",
+                "question",
+                "none"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "description": "false: bin/decide skips Jev and uses the point's fallback.",
+                  "type": "boolean"
+                },
+                "minConfidence": {
+                  "description": "Below this confidence bin/decide uses the point's fallback. Confidence is (n * pmax - 1) / (n - 1) over n options.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "question": {
+                  "description": "Fixed wording sent to Jev.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                },
+                "none": {
+                  "description": "Criterion for choosing no recipe.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                }
+              }
+            },
+            "ui": {
+              "description": "Once per task after implementation: the changed paths and commit subjects since the base say whether the task changed a UI, which drives verify ui and design ui. Fallback: yes.",
+              "type": "object",
+              "required": [
+                "enabled",
+                "minConfidence",
+                "question",
+                "yes",
+                "no"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "description": "false: bin/decide skips Jev and uses the point's fallback.",
+                  "type": "boolean"
+                },
+                "minConfidence": {
+                  "description": "Below this confidence bin/decide uses the point's fallback. Confidence is (n * pmax - 1) / (n - 1) over n options.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "question": {
+                  "description": "Fixed wording sent to Jev.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                },
+                "yes": {
+                  "description": "Criterion for yes.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                },
+                "no": {
+                  "description": "Criterion for no.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

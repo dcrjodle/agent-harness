@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Run the real app for the current task worktree and check it against the design — the verifier (medium model) captures screenshots, the designer (large model) compares them with the reference.
+description: Run the real app for the current task worktree and check it against the design — the verifier captures screenshots, the designer compares them with the reference.
 argument-hint: "[checks, design reference, or checks file]"
 ---
 1. Spawn the `verifier` role (`~/.agent-harness/agents/verifier.md`) on the current task worktree. Checks: $ARGUMENTS (default: the `verify` checks in `<handoff>/checks.md`). It writes `<handoff>/verify-N.md` and `<handoff>/shots/`.

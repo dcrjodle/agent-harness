@@ -23,22 +23,35 @@ prune() {
   return 0
 }
 
+# Harness entries (commands under .agent-harness/hooks/) are stripped from every event once, emptied
+# events dropped, then appended again: stripping per event while adding would drop the guard as soon as
+# a second harness entry joins PreToolUse. Other entries stay as they are.
 merge_hooks() {
-  local file="$1" guard_matcher="$2"
+  local file="$1" guard_matcher="$2" claude="$3"
   command -v jq >/dev/null || { echo "jq not found: add hooks to $file by hand (see README)"; return 0; }
   [ -s "$file" ] || echo '{}' > "$file"
   [ -e "$file.pre-harness" ] || cp "$file" "$file.pre-harness"
   local tmp; tmp="$(mktemp)"
   jq --arg ctx 'f="$HOME/.agent-harness/hooks/session-context.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
      --arg guard 'f="$HOME/.agent-harness/hooks/guard.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
-     --arg log 'f="$HOME/.agent-harness/hooks/stage-log.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
-     --arg matcher "$guard_matcher" --argjson subagents "$3" '
-    def strip: map(.hooks = ((.hooks // []) | map(select((.command // "") | contains(".agent-harness/hooks/") | not)))) | map(select(.hooks | length > 0));
-    def add(ev; entry): .hooks[ev] = (((.hooks[ev] // []) | strip) + [entry]);
-    .hooks = (.hooks // {})
-    | add("SessionStart"; {hooks: [{type: "command", command: $ctx}]})
-    | add("PreToolUse"; (if $matcher == "" then {} else {matcher: $matcher} end) + {hooks: [{type: "command", command: $guard}]})
-    | if $subagents then add("SubagentStart"; {hooks: [{type: "command", command: $log}]}) | add("SubagentStop"; {hooks: [{type: "command", command: $log}]}) else . end
+     --arg log 'f="$HOME/.agent-harness/hooks/session-log.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
+     --arg decide 'f="$HOME/.agent-harness/hooks/decide-context.sh"; [ -x "$f" ] || exit 0; exec "$f"' \
+     --arg matcher "$guard_matcher" --argjson claude "$claude" '
+    def harness: (.command // "") | contains(".agent-harness/hooks/");
+    def strip: if type == "array" then map(.hooks = ((.hooks // []) | map(select(harness | not)))) | map(select(.hooks | length > 0)) else . end;
+    def add(ev; entry): .hooks[ev] = ((.hooks[ev] // []) + [entry]);
+    def run(c): {type: "command", command: c};
+    .hooks = ((.hooks // {}) | map_values(strip) | with_entries(select(.value != [])))
+    | add("SessionStart"; {hooks: [run($ctx)]})
+    | add("PreToolUse"; (if $matcher == "" then {} else {matcher: $matcher} end) + {hooks: [run($guard)]})
+    | if $claude then
+        add("PreToolUse"; {matcher: "Skill", hooks: [run($decide) + {timeout: 30}]})
+        | add("UserPromptExpansion"; {matcher: "solve", hooks: [run($decide) + {timeout: 30}]})
+        | add("SubagentStart"; {hooks: [run($log) + {timeout: 10}]})
+        | add("SubagentStop"; {hooks: [run($log) + {timeout: 10}]})
+        | add("PostToolUse"; {matcher: "Agent", hooks: [run($log) + {timeout: 10}]})
+        | add("SessionEnd"; {hooks: [run($log) + {timeout: 5}]})
+      else . end
   ' "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp" && echo "hooks merged into $file (backup: $file.pre-harness)" \
     || { echo "hook merge failed for $file" >&2; rm -f "$tmp"; return 1; }
 }
@@ -64,6 +77,8 @@ ln -sfn "$PWD" "$HARNESS"
 [ -f MACHINE.md ] || printf '# Machine rules — personal, gitignored. Overrides repo docs. See MACHINE.example.md.\n' > MACHINE.md
 mkdir -p cache/recipes logs
 chmod +x bin/* hooks/*.sh
+node -e 'process.exit(typeof require("node:util").parseEnv === "function" ? 0 : 1)' 2>/dev/null \
+  || echo "warning: bin/decide (level, recipe and ui decisions) and bin/session-log (the session log) need Node 20.12 or later on PATH"
 
 # Claude Code — roles, skills, hooks, CLAUDE.md import
 mkdir -p "$HOME/.claude/agents" "$HOME/.claude/skills" "$HOME/.claude/commands"
@@ -85,4 +100,4 @@ echo "codex: approve the new hooks when Codex asks you to trust them."
 
 echo "cursor: add a User Rule in Cursor settings: 'Read ~/.agent-harness/AGENTS.md and follow it exactly.'"
 echo "cursor: per repo, run ./setup.sh --project <repo-path> to link the rule + skills as commands."
-echo "harness linked at $HARNESS — edit .env and MACHINE.md"
+echo "harness linked at $HARNESS — edit .env (TYPESAFE_API_KEY lets decisions ask Jev; COCKPIT_SUPABASE_URL and COCKPIT_SUPABASE_SECRET_KEY turn on the session log) and MACHINE.md"

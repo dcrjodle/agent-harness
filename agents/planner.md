@@ -1,6 +1,6 @@
 ---
 name: planner
-description: Plan stage of the loop. Explores the code and writes a binding plan with parallel lanes, plus the acceptance checks.
+description: Plan stage of a solve whose level has plan on. Explores the code and writes a binding plan with parallel lanes, plus the acceptance checks.
 tools: Bash, Read, Grep, Glob, Write
 model: opus
 ---
