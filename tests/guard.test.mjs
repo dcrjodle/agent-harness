@@ -19,10 +19,10 @@ describe("H-D hooks/guard.sh", () => {
   });
   after(() => s.remove());
 
-  const guard = (command, { agent = false, role = "tester", tool = "Bash", cwd, input, home } = {}) => {
+  const guard = (command, { agent = false, role = "tester", tool = "Bash", cwd, input, home, timeoutMs } = {}) => {
     const payload = { tool_name: tool, cwd: cwd ?? task, tool_input: input ?? { command } };
     if (agent) Object.assign(payload, { agent_id: "agent-1", agent_type: role });
-    return run("/bin/bash", [GUARD], { input: JSON.stringify(payload), env: s.env(home ? { HOME: home } : {}), cwd: s.root });
+    return run("/bin/bash", [GUARD], { input: JSON.stringify(payload), env: s.env(home ? { HOME: home } : {}), cwd: s.root, timeoutMs });
   };
   const allowed = (r, command) => {
     assert.equal(r.code, 0, `denied: ${command}\n${r.stderr}`);
@@ -350,5 +350,223 @@ describe("H-D hooks/guard.sh", () => {
         allowed(await guard(decideWith("/tmp/h"), { agent: true, home: installed }), decideWith("/tmp/h"));
       });
     });
+  });
+
+  // ---------- round 2: the fixes after review-1 and the first test round ----------
+
+  describe("R2 a substitution in a command's leading words does not hide the command", () => {
+    describe("a sub-agent", { concurrency: 8 }, () => {
+      table(
+        [
+          ["a variable set from $( ) in front of decide", "CLAUDE_CODE_SESSION_ID=$(uuidgen) ~/.agent-harness/bin/decide start -- x", /orchestrator/],
+          ["a variable set from backticks in front of decide", "CLAUDE_CODE_SESSION_ID=`uuidgen` bin/decide start -- x", /orchestrator/],
+          ["HARNESS_DIR set from $( ) in front of session-log", "HARNESS_DIR=$(echo ~/.agent-harness) bin/session-log flush", /scratch HARNESS_DIR/],
+          ["HARNESS_DIR set from backticks in front of session-log", "HARNESS_DIR=`echo ~/.agent-harness` bin/session-log flush", /scratch HARNESS_DIR/],
+          ["HARNESS_DIR set from a double-quoted $( )", 'HARNESS_DIR="$(mktemp -d)" bin/session-log flush', /scratch HARNESS_DIR/],
+          ["a substituted HARNESS_DIR is never a scratch dir, for session-log", "HARNESS_DIR=$(mktemp -d) bin/session-log flush", /scratch HARNESS_DIR/],
+          ["a substituted HARNESS_DIR is never a scratch dir, for decide", "HARNESS_DIR=$(mktemp -d) TYPESAFE_BASE_URL=http://127.0.0.1:9 bin/decide level x", /scratch (harness|HARNESS_DIR)/],
+          ["env in front, with $( )", "env HARNESS_DIR=$(echo x) bin/session-log flush", /scratch HARNESS_DIR/],
+          ["env in front of decide, with $( )", "env FOO=$(date) bin/decide level x", /orchestrator/],
+          ["env in front of decide, with backticks", "env FOO=`date` bin/decide level x", /orchestrator/],
+          ["a wrapper, then env", "timeout 5 env A=$(date) bin/decide level x", /orchestrator/],
+          ["two substitutions in two assignments", "A=$(date) B=`pwd` bin/decide level x", /orchestrator/],
+          ["a substitution as the start of the command's path", "$(echo ~)/.agent-harness/bin/decide level x", /orchestrator/],
+          ["inside a subshell", "(HARNESS_DIR=$(echo ~/.agent-harness) bin/session-log flush)", /scratch HARNESS_DIR/],
+          ["after then", "if true; then HARNESS_DIR=$(pwd) bin/session-log flush; fi", /scratch HARNESS_DIR/],
+          ["inside a loop", "for i in 1; do A=$(date) bin/decide level x; done", /orchestrator/],
+          ["on its own line after an assignment from $( )", "x=$(date)\nbin/decide level x", /orchestrator/],
+          ["a substitution among the arguments", "bin/decide level $(echo x)", /orchestrator/],
+          ["a substitution in an earlier command", "echo $(date); bin/decide level x", /orchestrator/],
+          ["a good call, then a bad one with a substitution", "A=$(date) HARNESS_DIR=/tmp/h TYPESAFE_BASE_URL=http://127.0.0.1:9 bin/decide level x; B=$(date) bin/decide level y", /orchestrator/],
+          ["inside a bash -c string", "bash -c 'HARNESS_DIR=$(echo x) bin/session-log flush'", /scratch HARNESS_DIR/],
+          ["a substitution in another assignment, with a scratch HARNESS_DIR (session-log)", "FOO=$(date) HARNESS_DIR=/tmp/h bin/session-log flush", true],
+          ["a substitution in another assignment, with a scratch HARNESS_DIR (decide)", "FOO=`date` HARNESS_DIR=/tmp/h TYPESAFE_BASE_URL=http://127.0.0.1:9 bin/decide level x", true],
+          ["two substitutions before the scratch HARNESS_DIR", "X=$(date) Y=$(pwd) HARNESS_DIR=/tmp/h bin/session-log flush", true],
+          ["a substitution after the scratch HARNESS_DIR", "HARNESS_DIR=/tmp/h FOO=$(date) bin/session-log flush", true],
+          ["a substitution that is only an argument of another command", "echo $(date) bin/decide level x", true],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("the main agent", { concurrency: 8 }, () => {
+      table([
+        ["a variable set from $( ) in front of decide", "SID=$(uuidgen) ~/.agent-harness/bin/decide start -- x", true],
+        ["HARNESS_DIR set from $( ) in front of session-log", "HARNESS_DIR=$(echo ~/.agent-harness) bin/session-log flush", true],
+        ["env with a substitution in front of decide", "env A=$(date) bin/decide level x", true],
+        ["a substitution as the start of the command's path", "$(echo ~)/.agent-harness/bin/decide level x", true],
+        ["an unknown decision point after a substitution is still unknown", "A=$(date) bin/decide size x", /unknown decision point/],
+      ]);
+    });
+  });
+
+  describe("R2 # comments with quotes in them do not hide the lines after them", () => {
+    describe("a sub-agent", { concurrency: 8 }, () => {
+      table(
+        [
+          ["an apostrophe in a comment line", "# don't touch the live one\nbin/decide level x", /orchestrator/],
+          ["a double quote in a comment line", '# say "hi\nbin/decide level x', /orchestrator/],
+          ["a backtick in a comment line", "# a `tick\nbin/session-log flush", /scratch HARNESS_DIR/],
+          ["an apostrophe in a trailing comment, with a call on the next line", "HARNESS_DIR=/tmp/h TYPESAFE_BASE_URL=http://127.0.0.1:9 bin/decide level x # it's fine\nbin/decide level y", /orchestrator/],
+          ["a trailing comment does not hide the call before it", "bin/decide level x # don't", /orchestrator/],
+          ["comment lines between two calls", "# first\nHARNESS_DIR=/tmp/h bin/session-log flush\n# it's second\nbin/session-log flush", /scratch HARNESS_DIR/],
+          ["a # inside a word is no comment", "echo a#b; bin/decide level x", /orchestrator/],
+          ["$# is no comment", "echo $#; bin/decide level x", /orchestrator/],
+          ["${#var} is no comment", "echo ${#HOME}; bin/decide level x", /orchestrator/],
+          ["a # in double quotes is no comment", 'echo "a # b"; bin/decide level x', /orchestrator/],
+          ["a # in single quotes is no comment", "echo 'a # b'; bin/decide level x", /orchestrator/],
+          ["a quoted heredoc line that looks like a comment does not hide the code after the heredoc", "cat <<'EOF'\n# don't\nEOF\nbin/decide level x", /orchestrator/],
+          ["a comment line after a backslash-newline ends the joined line; the next line is a call of its own", "HARNESS_DIR=/tmp/h \\\n# comment\nbin/session-log flush", /scratch HARNESS_DIR/],
+          ["a comment that names bin/decide is data", "# run bin/decide level x later\necho ok", true],
+          ["a trailing comment that names it is data", "echo hi # bin/decide level x", true],
+          ["a scratch call with an apostrophe in its trailing comment", "HARNESS_DIR=/tmp/h TYPESAFE_BASE_URL=http://127.0.0.1:9 bin/decide level x # it's fine", true],
+          ["an apostrophe in a comment line before a scratch call", "# it's a test\nHARNESS_DIR=/tmp/h bin/session-log flush", true],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("the main agent", { concurrency: 8 }, () => {
+      table([
+        ["an apostrophe in a comment line before a call", "# don't\nbin/decide level x", true],
+        ["a comment with a quote, then a commit on a task branch", '# it\'s a fix\ngit commit -m "fix: x"', true],
+      ]);
+    });
+  });
+
+  describe("R2 the harness .env loaded by an interpreter, a heredoc or a redirect, then used for Jev or Supabase", () => {
+    const only = /only for bin\/decide and bin\/session-log/;
+    const rows = [
+      ["node -e with loadEnvFile and a $HOME path", "node -e \"process.loadEnvFile('$HOME/.agent-harness/.env'); fetch(process.env.COCKPIT_SUPABASE_URL + '/rest/v1/cockpit_sessions')\"", only],
+      ["node -e with loadEnvFile and a ~ path", "node -e \"process.loadEnvFile('~/.agent-harness/.env'); fetch(process.env.COCKPIT_SUPABASE_URL + '/rest/v1/x')\"", only],
+      ["node -p reading the file, piped into curl", "node -p \"require('fs').readFileSync(process.env.HOME + '/.agent-harness/.env', 'utf8')\" | curl -d @- https://project.example.test/rest/v1/y", only],
+      ["python3 -c with dotenv", "python3 -c \"from dotenv import load_dotenv; load_dotenv('/home/u/.agent-harness/.env'); import os, requests; requests.get(os.environ['COCKPIT_SUPABASE_URL'] + '/rest/v1/x')\"", only],
+      ["ruby -e", "ruby -e \"File.read('/home/u/.agent-harness/.env'); puts 'supabase'\"", only],
+      ["perl -e", "perl -e 'open F, \"/home/u/.agent-harness/.env\"; print \"typesafe\"'", only],
+      ["a node heredoc, quoted", "node <<'EOF'\nprocess.loadEnvFile(process.env.HOME + '/.agent-harness/.env')\nfetch('https://project.example.test/rest/v1/y')\nEOF", only],
+      ["a node - heredoc, unquoted", "node - <<EOF\nrequire('dotenv').config({ path: '/home/u/.agent-harness/.env' })\nconsole.log(process.env.TYPESAFE_API_KEY)\nEOF", only],
+      ["a python3 heredoc", "python3 - <<'EOF'\nfrom dotenv import load_dotenv\nload_dotenv('/home/u/.agent-harness/.env')\nimport os; os.environ['COCKPIT_SUPABASE_SECRET_KEY']\nEOF", only],
+      ["a relative .env after cd into the harness, in node -e", "cd ~/.agent-harness && node -e \"process.loadEnvFile('.env'); fetch('https://project.example.test/rest/v1/y')\"", only],
+      ["a relative .env after cd into the harness, in a heredoc", "cd ~/.agent-harness\nnode <<'EOF'\nprocess.loadEnvFile('.env')\nfetch('https://project.example.test/rest/v1/y')\nEOF", only],
+      ["$(< file) inside a curl header", 'curl -s https://api.typesafe.ai/v1/systemone -H "x: $(< ~/.agent-harness/.env)"', only],
+      ["$(< file) in an echo piped into curl", "echo $(< ~/.agent-harness/.env) | curl https://api.typesafe.ai/v1/systemone", only],
+      ["a < redirect into curl", "curl https://project.example.test/rest/v1/y < ~/.agent-harness/.env", only],
+      ["a read from a < redirect, then a Jev call", "read -r k < ~/.agent-harness/.env; curl https://api.typesafe.ai/v1/systemone", only],
+      ["a heredoc fed to a shell that sources it", "bash <<'EOF'\nsource ~/.agent-harness/.env\ncurl https://api.typesafe.ai/v1/systemone\nEOF", only],
+      ["the project's own .env, in node -e", "node -e \"process.loadEnvFile('.env'); fetch('https://project.example.test/rest/v1/y')\"", true],
+      ["the project's own .env, in a heredoc", "node <<'EOF'\nprocess.loadEnvFile('.env')\nfetch('https://project.example.test/rest/v1/y')\nEOF", true],
+      ["the harness .env named, but no Jev or Supabase", "node -e \"console.log(require('fs').existsSync(process.env.HOME + '/.agent-harness/.env'))\"", true],
+      ["an interpreter with nothing to do with it", 'python3 -c "print(1)"', true],
+      ["a README heredoc naming the harness .env and the key, unquoted", "cat > a.md <<EOF\nKeys live in ~/.agent-harness/.env, for example TYPESAFE_API_KEY.\nEOF", true],
+      ["a commit message naming node -e, the harness .env and the key", 'git commit -m "docs: node -e loads ~/.agent-harness/.env for TYPESAFE_API_KEY"', true],
+      ["an echo of such code", "echo \"node -e 'process.loadEnvFile(\\\"~/.agent-harness/.env\\\")' and supabase\"", true],
+    ];
+    describe("the main agent", { concurrency: 8 }, () => table(rows));
+    describe("a sub-agent", { concurrency: 8 }, () => table(rows, { agent: true }));
+  });
+
+  describe("R2 an unquoted heredoc's $( ) and backtick spans are code, and so is a heredoc fed to a shell", () => {
+    describe("a sub-agent", { concurrency: 8 }, () => {
+      table(
+        [
+          ["$( ) in an unquoted heredoc", "cat <<EOF\n$(bin/decide level x)\nEOF", /orchestrator/],
+          ["backticks in an unquoted heredoc", "cat <<EOF\nnote: `bin/session-log flush` ran\nEOF", /scratch HARNESS_DIR/],
+          ["$( ) in a <<- heredoc with tabs", "cat <<-EOF\n\t$(bin/decide level x)\n\tEOF", /orchestrator/],
+          ["a $( ) that spans lines in an unquoted heredoc", "cat <<EOF\n$(\n  bin/decide level x\n)\nEOF", /orchestrator/],
+          ["code after an unquoted heredoc is code", "cat <<EOF > f\nrun $(date)\nEOF\nbin/session-log flush", /scratch HARNESS_DIR/],
+          ["code after a quoted heredoc is code", "cat <<'EOF'\nplain\nEOF\nbin/decide level x", /orchestrator/],
+          ["a heredoc fed to bash", "bash <<'EOF'\nbin/decide level x\nEOF", /orchestrator/],
+          ["a heredoc fed to sh, unquoted", "sh <<EOF\nbin/session-log flush\nEOF", /scratch HARNESS_DIR/],
+          ["a heredoc fed to bash -s", "bash -s <<'EOF'\nbin/decide start -- x\nEOF", /orchestrator/],
+          ["a heredoc fed to zsh", "zsh <<'EOF'\nbin/decide ui .\nEOF", /orchestrator/],
+          ["a <<- heredoc fed to bash", "bash <<-'EOF'\n\tbin/decide level x\n\tEOF", /orchestrator/],
+          ["the live HARNESS_DIR inside a heredoc fed to bash", "bash <<'EOF'\nHARNESS_DIR=~/.agent-harness bin/session-log flush\nEOF", /scratch HARNESS_DIR/],
+          ["a quoted heredoc: $( ) is data", "cat <<'EOF'\n$(bin/decide level x)\nEOF", true],
+          ["a double-quoted delimiter: $( ) is data", 'cat <<"EOF"\n$(bin/decide level x)\nEOF', true],
+          ["a backslash-escaped delimiter: $( ) is data", "cat <<\\EOF\n$(bin/decide level x)\nEOF", true],
+          ["a quoted heredoc: backticks are data", "cat <<'EOF'\n`bin/session-log flush`\nEOF", true],
+          ["an unquoted heredoc that only mentions the command", "cat <<EOF\nrun bin/decide level x first\nEOF", true],
+          ["text after a closed $( ) in an unquoted heredoc is text", "cat <<EOF\nsee $(echo hi) and bin/decide level x\nEOF", true],
+          ["a heredoc fed to bash that calls nothing guarded", "bash <<'EOF'\necho hello\nEOF", true],
+          ["a script written by cat is data", "cat > run.sh <<'EOF'\nbin/decide level x\nEOF", true],
+          ["a scratch call inside a heredoc fed to bash", "bash <<'EOF'\nHARNESS_DIR=/tmp/h bin/session-log flush\nEOF", true],
+        ],
+        { agent: true },
+      );
+    });
+
+    describe("the main agent", { concurrency: 8 }, () => {
+      table([
+        ["$( ) in an unquoted heredoc", "cat <<EOF\n$(bin/decide level x)\nEOF", true],
+        ["a heredoc fed to bash", "bash <<'EOF'\nbin/decide level x\nEOF", true],
+      ]);
+    });
+  });
+
+  describe("R2 a backslash-newline joins lines as in bash", () => {
+    table(
+      [
+        ["the scratch variables on continued lines", "HARNESS_DIR=/tmp/h \\\n  TYPESAFE_BASE_URL=http://127.0.0.1:9 \\\n  bin/decide level x", true],
+        ["a scratch HARNESS_DIR on a continued line, for session-log", "HARNESS_DIR=/tmp/h \\\n  bin/session-log flush", true],
+        ["bin/decide and its point on two lines", "bin/decide \\\nlevel x", /orchestrator/],
+        ["a wrapper on one line, the call on the next", "timeout 10 \\\n  bin/decide level x", /orchestrator/],
+        ["the live HARNESS_DIR on a continued line", "HARNESS_DIR=~/.agent-harness \\\n  bin/session-log flush", /scratch HARNESS_DIR/],
+        ["a command after a joined line", "echo a \\\n  b; bin/decide level x", /orchestrator/],
+        ["an escaped backslash at the end of a line is no continuation", "echo a\\\\\nbin/decide level x", /orchestrator/],
+        ["a blank line after a continuation ends the command", "echo a \\\n\nbin/decide level x", /orchestrator/],
+        ["a continuation inside double quotes", 'echo "a \\\n b"; bin/decide level x', /orchestrator/],
+      ],
+      { agent: true },
+    );
+  });
+
+  // The guard first looks for the literal name in the command text, so these still pass today. They are pinned
+  // as the known limit: if the guard learns to read them, flip the rows to denies.
+  describe("R2 known limit: a name split by quotes or a line continuation still passes", () => {
+    table(
+      [
+        ['bin/de"ci"de', 'bin/de"ci"de level x', true],
+        ["bin/de'ci'de", "bin/de'ci'de level x", true],
+        ["a line continuation inside bin/decide", "bin/dec\\\nide level x", true],
+        ['bin/session-lo"g"', 'bin/session-lo"g" flush', true],
+        ["a line continuation inside bin/session-log", "bin/sess\\\nion-log flush", true],
+      ],
+      { agent: true },
+    );
+  });
+
+  describe("R2 1 MB lines with hundreds of thousands of substitutions are read in time", () => {
+    const BUDGET_MS = 2000;
+    const MB = 1_000_000;
+    const repeat = (unit, bytes) => unit.repeat(Math.ceil(bytes / unit.length));
+    const lines = (count, make) => Array.from({ length: count }, (_, i) => make(i)).join("\n");
+    // Up to three runs: a slow guard is slow every time, a busy machine only now and then. A run over six times the
+    // budget is killed and fails the test at once.
+    const timedBest = async (t, command, expected) => {
+      const times = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const r = await guard(command, { agent: true, timeoutMs: 6 * BUDGET_MS });
+        assert.equal(r.code, expected, `exit ${r.code}: ${r.stderr.slice(0, 300)}`);
+        times.push(r.ms);
+        if (r.ms <= BUDGET_MS) break;
+      }
+      t.diagnostic(`${Math.round(command.length / 1000)} KB took ${times.join(", ")} ms`);
+      assert.ok(Math.min(...times) <= BUDGET_MS, `took ${times.join(", ")} ms, the budget is ${BUDGET_MS} ms`);
+    };
+    const shapes = [
+      ["1 MB of $(date) arguments", `echo ${repeat("$(date) ", MB)}`, 0],
+      ["1 MB of empty $() substitutions", repeat("$()", MB), 0],
+      ["1 MB of empty backtick pairs", repeat("``", MB), 0],
+      ["1 MB of $( ) and backtick substitutions mixed", repeat("$(a) `b` ", MB), 0],
+      ["1 MB of double-quoted text full of substitutions", `echo "${repeat("a $(date) b `pwd` ", MB)}"`, 0],
+      ["30,000 lines of x=$(date); echo $x (900 KB)", lines(30_000, (i) => `x${i}=$(date); echo "$x${i}"`), 0],
+      ["500,000 one-letter commands separated by ; (1 MB), then bin/decide", `${repeat("a;", MB)} bin/decide level x`, 2],
+      ["a 1 MB chain of VAR=$(..) words in front of bin/decide", `${repeat("A=$(x) ", MB)}bin/decide level x`, 2],
+      ["a 1 MB chain of VAR=`..` words in front of bin/decide", `${repeat("A=`x` ", MB)}bin/decide level x`, 2],
+      ["a 1 MB env chain in front of bin/session-log", `env ${repeat("A=$(x) ", MB)}bin/session-log flush`, 2],
+      ["1 MB of $(..) arguments, then bin/decide as the next command", `echo ${repeat("$(date) ", MB)}; bin/decide level x`, 2],
+      ["an unquoted heredoc of 20,000 lines with $( ) and backticks, then bin/decide", `cat <<EOF\n${lines(20_000, (i) => `line ${i} $(date) and \`pwd\` here`)}\nEOF\nbin/decide level x`, 2],
+    ];
+    for (const [name, command, expected] of shapes) it(`${name}: ${expected === 0 ? "allowed" : "denied"} within ${BUDGET_MS} ms`, (t) => timedBest(t, command, expected));
   });
 });
