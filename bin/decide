@@ -5,13 +5,14 @@
 // fallbacks, cached answers in logs/decisions/, every decision appended to logs/decisions.jsonl.
 // Never blocks work: every decision exits 0, fallbacks included; usage and settings errors exit 2.
 // Dir: $HARNESS_DIR or this script's repo. Key: TYPESAFE_API_KEY from <dir>/.env only.
+// A task of issue numbers only is decided on the issues' titles and first body lines (gh, in the repo).
 "use strict";
 
 const fs = require("node:fs");
 const path = require("node:path");
 const util = require("node:util");
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 
 const USAGE = `usage:
   decide level  [--repo DIR] [--json] [--] TASK...  pick the level for a task
@@ -20,6 +21,7 @@ const USAGE = `usage:
   decide start  [--repo DIR] [--json] [--] TASK...  level, then recipe when the repo has recipes
   decide stages [--json] LEVEL                      a level's stages, without Jev
   decide check  [FILE]                              validate settings.json
+A TASK of issue numbers only ("41 42") is read with gh issue view in the repo.
 `;
 
 const SCRIPT_ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
@@ -30,6 +32,10 @@ const RETRY_DELAY_MS = 250;
 const RETRY_MIN_LEFT_MS = 1000;
 const MAX_PATHS = 300;
 const MAX_COMMITS = 100;
+const GH_TIMEOUT_MS = 5000;
+const MAX_ISSUES = 10;
+const ISSUE_BODY_LINES = 5;
+const ISSUE_BODY_CHARS = 600;
 
 class Exit extends Error {
   constructor(code, out, err) {
@@ -237,9 +243,61 @@ function listRecipes(repo) {
   return recipes.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
+// A task of issue numbers only ("41 42", "#41, #42") → the numbers; any other task → null.
+function issueRefs(text) {
+  return /^#?\d+(?:[\s,]+#?\d+)*$/.test(text) ? [...new Set(text.match(/\d+/g).map((n) => String(Number(n))))] : null;
+}
+
+// "#<n> <title>" and the body's first non-empty lines (HTML comments dropped), from gh issue view in
+// the repo; null when gh fails or takes longer than GH_TIMEOUT_MS (its pipes are not waited for).
+function ghIssue(ref, cwd) {
+  return new Promise((resolve) => {
+    const env = { ...process.env, GH_PROMPT_DISABLED: "1", NO_COLOR: "1" };
+    let out = "";
+    let child;
+    const done = (text) => {
+      clearTimeout(timer);
+      child?.stdout?.destroy();
+      resolve(text);
+    };
+    const timer = setTimeout(() => {
+      child?.kill("SIGKILL");
+      done(null);
+    }, GH_TIMEOUT_MS);
+    try {
+      child = spawn("gh", ["issue", "view", ref, "--json", "title,body"], { cwd, env, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      return done(null);
+    }
+    child.on("error", () => done(null));
+    child.stdout.setEncoding("utf8").on("data", (d) => (out += d));
+    child.on("close", (code) => {
+      let issue = null;
+      try {
+        issue = code === 0 ? JSON.parse(out) : null;
+      } catch {}
+      const title = issue && typeof issue.title === "string" ? issue.title.trim() : "";
+      if (!title) return done(null);
+      const body = (typeof issue.body === "string" ? issue.body : "").replace(/<!--[\s\S]*?-->/g, "");
+      const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, ISSUE_BODY_LINES);
+      const text = [...lines.join("\n")].slice(0, ISSUE_BODY_CHARS).join("");
+      done(text ? `#${ref} ${title}\n${text}` : `#${ref} ${title}`);
+    });
+  });
+}
+
+// The text Jev decides on for issue numbers: every issue read (at most MAX_ISSUES, at once), else null.
+async function issueText(refs, cwd) {
+  const texts = await Promise.all(refs.slice(0, MAX_ISSUES).map((ref) => ghIssue(ref, cwd)));
+  if (!texts.every(Boolean)) return null;
+  if (refs.length > MAX_ISSUES) texts.push(`and ${refs.length - MAX_ISSUES} more issues`);
+  return normalize(texts.join("\n\n"));
+}
+
 // ---------- decision points ----------
 
-function levelSpec(settings, task) {
+// `issues`: for a task of issue numbers, a function that reads their text once (see issueText).
+function levelSpec(settings, task, issues) {
   const ids = settings.levels.map((l) => l.id);
   return {
     point: "level",
@@ -247,13 +305,14 @@ function levelSpec(settings, task) {
     options: ids,
     pairs: settings.levels.map((l) => [l.id, l.description]),
     input: task.text,
+    issues,
     override: task.override,
     // The more thorough of the top two; without an answer (uniform) that is the second level.
     fallback: (probs) => ids[Math.max(...rank(ids, probs).slice(0, 2))],
   };
 }
 
-function recipeSpec(settings, task, recipes) {
+function recipeSpec(settings, task, recipes, issues) {
   const none = settings.decisions.points.recipe.none;
   return {
     point: "recipe",
@@ -261,6 +320,7 @@ function recipeSpec(settings, task, recipes) {
     options: ["none", ...recipes.map((r) => r.name)],
     pairs: [["none", none], ...recipes.map((r) => [r.name, r.title])],
     input: task.rest,
+    issues,
     noRecipes: recipes.length === 0,
     fallback: () => "none",
   };
@@ -297,6 +357,12 @@ async function runPoint(settings, spec, repo) {
   if (spec.override) return { ...d, value: spec.override, source: "override", reason: "first-word" };
   if (spec.noRecipes) return { ...d, value: spec.fallback(null), reason: "no-recipes" };
   if (!cfg.enabled) return { ...d, value: spec.fallback(null), reason: "disabled" };
+  if (spec.issues) {
+    const text = await spec.issues();
+    if (!text) return { ...d, value: spec.fallback(null), reason: "no-issue-text" };
+    spec = { ...spec, input: text };
+    d.inputHash = `sha256:${sha256(text)}`;
+  }
 
   const model = settings.decisions.model;
   const key = sha256(JSON.stringify([spec.point, model, cfg.question, spec.pairs, spec.input]));
@@ -477,17 +543,19 @@ function emit(d, json) {
 
 // ---------- commands ----------
 
-// Options come first; the first other argument or "--" ends them.
-function parseOptions(args, valued, flags) {
+// Options come first; the first other argument or "--" ends them. With `anywhere` (commands without
+// task text) options may also follow the arguments; "--" still ends them.
+function parseOptions(args, valued, flags, anywhere = false) {
   const opts = {};
-  let i = 0;
-  for (; i < args.length; i++) {
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--") {
-      i++;
-      break;
+    if (a === "--") return { opts, rest: rest.concat(args.slice(i + 1)) };
+    if (!a.startsWith("--")) {
+      if (!anywhere) return { opts, rest: args.slice(i) };
+      rest.push(a);
+      continue;
     }
-    if (!a.startsWith("--")) break;
     const eq = a.indexOf("=");
     const name = eq === -1 ? a : a.slice(0, eq);
     if (flags.includes(name) && eq === -1) opts[name.slice(2)] = true;
@@ -497,7 +565,7 @@ function parseOptions(args, valued, flags) {
       opts[name.slice(2)] = value;
     } else usage(`unknown option ${a}`);
   }
-  return { opts, rest: args.slice(i) };
+  return { opts, rest };
 }
 
 async function taskCommand(cmd, args) {
@@ -505,19 +573,24 @@ async function taskCommand(cmd, args) {
   if (!normalize(rest.join(" "))) usage(`${cmd}: no task`);
   const settings = loadSettings();
   const task = parseTask(rest, settings.levels);
-  const repo = repoName(path.resolve(opts.repo || "."));
+  const repoDir = path.resolve(opts.repo || ".");
+  const repo = repoName(repoDir);
+  // Issue numbers only: read once, when a point needs Jev, and shared by level and recipe.
+  const refs = issueRefs(task.rest);
+  let read = null;
+  const issues = refs && (() => (read ??= issueText(refs, repoDir)));
 
-  if (cmd === "level") return emit(await runPoint(settings, levelSpec(settings, task), repo), opts.json);
+  if (cmd === "level") return emit(await runPoint(settings, levelSpec(settings, task, issues), repo), opts.json);
   if (cmd === "recipe") {
     if (!task.rest) usage("recipe: no task after the level word");
-    return emit(await runPoint(settings, recipeSpec(settings, task, listRecipes(repo)), repo), opts.json);
+    return emit(await runPoint(settings, recipeSpec(settings, task, listRecipes(repo), issues), repo), opts.json);
   }
 
   // start: both points at once; recipe only when the repo has recipes and a task is left.
   const recipes = task.rest ? listRecipes(repo) : [];
   const [lv, rc] = await Promise.all([
-    runPoint(settings, levelSpec(settings, task), repo),
-    recipes.length ? runPoint(settings, recipeSpec(settings, task, recipes), repo) : null,
+    runPoint(settings, levelSpec(settings, task, issues), repo),
+    recipes.length ? runPoint(settings, recipeSpec(settings, task, recipes, issues), repo) : null,
   ]);
   const lvLine = appendLog(lv);
   const rcLine = rc ? appendLog(rc) : null;
@@ -535,7 +608,7 @@ async function taskCommand(cmd, args) {
 }
 
 async function uiCommand(args) {
-  const { opts, rest } = parseOptions(args, ["--base"], ["--json"]);
+  const { opts, rest } = parseOptions(args, ["--base"], ["--json"], true);
   if (rest.length !== 1) usage("ui: give one WORKTREE");
   const settings = loadSettings();
   const wt = path.resolve(rest[0]);
@@ -564,7 +637,7 @@ async function uiCommand(args) {
 }
 
 function stagesCommand(args) {
-  const { opts, rest } = parseOptions(args, [], ["--json"]);
+  const { opts, rest } = parseOptions(args, [], ["--json"], true);
   if (rest.length !== 1) usage("stages: give one LEVEL");
   const settings = loadSettings();
   const level = findLevel(settings.levels, rest[0]);
@@ -574,7 +647,7 @@ function stagesCommand(args) {
 }
 
 function checkCommand(args) {
-  const { rest } = parseOptions(args, [], []);
+  const { rest } = parseOptions(args, [], [], true);
   if (rest.length > 1) usage("check: give at most one FILE");
   const r = readSettings(rest.length ? path.resolve(rest[0]) : path.join(DIR, "settings.json"));
   return r.problem ? { code: 2, out: `${r.problem}\n` } : { code: 0, out: "ok\n" };
