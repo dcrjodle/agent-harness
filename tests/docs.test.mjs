@@ -31,6 +31,8 @@ function baseCommit() {
   return candidates.find((rev) => rev && git("rev-parse", "--verify", "--quiet", `${rev}^{commit}`).status === 0) || null;
 }
 
+const inGit = () => git("rev-parse", "--is-inside-work-tree").status === 0;
+
 // The base of the sessions round: <worktree>.handoff/sessions/base beside the worktree, else the task's base.
 function sessionsBase() {
   const beside = path.join(path.dirname(REPO), `${path.basename(REPO)}.handoff`, "sessions", "base");
@@ -166,7 +168,8 @@ describe("H-F the session log is documented and the public repo is clean", () =>
       assert.equal(fs.existsSync(path.join(REPO, "hooks", "stage-log.sh")), false);
     });
 
-    it("no tracked file outside tests/ names stage-times, stage-log, stages.tsv or decisions.jsonl", () => {
+    it("no tracked file outside tests/ names stage-times, stage-log, stages.tsv or decisions.jsonl", (t) => {
+      if (!inGit()) return t.skip("not a git checkout");
       const r = git("grep", "-n", "-e", "stage-times", "-e", "stage-log", "-e", "stages.tsv", "-e", "decisions.jsonl", "--", ".", ":!tests");
       assert.equal(r.status, 1, `git grep found matches:\n${r.stdout}${r.stderr}`);
       assert.equal(r.stdout, "");
@@ -194,7 +197,8 @@ describe("H-F the session log is documented and the public repo is clean", () =>
       assert.deepEqual(found, []);
     });
 
-    it("no tracked file at all holds a project URL, a key or a machine path", () => {
+    it("no tracked file at all holds a project URL, a key or a machine path", (t) => {
+      if (!inGit()) return t.skip("not a git checkout");
       const r = git("grep", "-n", "-E", ...patterns.flatMap((pattern) => ["-e", pattern]), "--", ".");
       assert.equal(r.status, 1, `git grep found:\n${r.stdout}${r.stderr}`);
       assert.equal(r.stdout, "");

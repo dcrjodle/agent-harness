@@ -164,7 +164,9 @@ describe("H-E setup.sh", () => {
       }
     });
 
-    it("the scripts are tracked as executable, so a fresh clone can run them", () => {
+    it("the scripts are tracked as executable, so a fresh clone can run them", (t) => {
+      const inside = spawnSync("git", ["-C", REPO, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", env: s.env() });
+      if (inside.status !== 0) return t.skip("not a git checkout");
       const r = spawnSync("git", ["-C", REPO, "ls-files", "-s", "--", ...EXECUTABLES], { encoding: "utf8", env: s.env() });
       assert.equal(r.status, 0, r.stderr);
       const modes = Object.fromEntries(r.stdout.trim().split("\n").map((line) => [line.split("\t")[1], line.split(" ")[0]]));

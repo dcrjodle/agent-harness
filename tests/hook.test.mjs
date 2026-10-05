@@ -275,6 +275,18 @@ describe("H-C hooks/session-log.sh", () => {
       assert.deepEqual(h.eventFiles(), []);
     });
 
+    it("prints nothing even when bin/session-log is missing next to it (a broken install)", async () => {
+      const h = makeHarness(s, { env: "" });
+      const broken = s.dir("broken-install");
+      fs.mkdirSync(path.join(broken, "hooks"));
+      fs.copyFileSync(SESSION_HOOK, path.join(broken, "hooks", "session-log.sh"));
+      fs.chmodSync(path.join(broken, "hooks", "session-log.sh"), 0o755);
+      const r = await run(path.join(broken, "hooks", "session-log.sh"), [], { input: JSON.stringify(started()), env: s.env({ HARNESS_DIR: h.dir }), cwd: s.root });
+      assert.equal(r.stdout, "");
+      assert.equal(r.stderr, "", "the hook's errors stay out of Claude Code's transcript");
+      assert.deepEqual(h.eventFiles(), []);
+    });
+
     it("exits 0 quietly in a harness whose logs folder cannot be written", async () => {
       const h = makeHarness(s, { env: "" });
       fs.writeFileSync(path.join(h.dir, "logs"), "this is a file, not a directory");
