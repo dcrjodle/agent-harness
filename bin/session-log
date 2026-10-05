@@ -86,7 +86,8 @@ function makeEvent(kind, sessionId, fields = {}, at = new Date()) {
       return isId(fields.agent_id) && role ? { ...e, agent_id: fields.agent_id, role, label: clip(fields.label, LIMIT.label) } : null;
     }
     case "agent_label": {
-      // `role` (the spawn's subagent_type) only when known: with it the label can create the agent's row.
+      // `role` (the spawn's subagent_type, general-purpose when it names none): with it the label can create
+      // the agent's row. A label without one (queued by an earlier version) only labels a row that exists.
       const label = clip(fields.label, LIMIT.label);
       const role = clip(fields.role, LIMIT.role);
       if (!isId(fields.agent_id) || !label) return null;
@@ -522,7 +523,9 @@ function metaLabel(transcript, agentId) {
 // A hook payload → the event it stands for, or null.
 //   SubagentStart → agent_start          SubagentStop → agent_stop          SessionEnd → session_end
 //   PostToolUse of the Agent tool, in the main session → agent_label (the description, and the
-//   subagent_type as the role so the label can create the row)
+//   subagent_type as the role so the label can create the row; a spawn that names none is a
+//   general-purpose agent, which SubagentStart reports as its agent_type, and agent_start sets the
+//   role it reports anyway)
 // The label comes from the PostToolUse: the agent's meta file, read at SubagentStart, is rarely written yet.
 // SubagentStop with an empty agent_type is one of the engine's own side agents, not a spawned one.
 function hookEvent(p) {
@@ -536,7 +539,7 @@ function hookEvent(p) {
       if (p.agent_id || (p.tool_name !== "Agent" && p.tool_name !== "Task")) return null;
       e = makeEvent("agent_label", p.session_id, {
         agent_id: p.tool_response?.agentId,
-        role: p.tool_input?.subagent_type,
+        role: p.tool_input?.subagent_type || "general-purpose",
         label: p.tool_input?.description,
       });
       break;
