@@ -1,0 +1,72 @@
+{
+  "$schema": "./settings.schema.json",
+  "version": 1,
+  "levels": [
+    {
+      "id": "small",
+      "label": "Small",
+      "description": "A small, contained change in one area of the code, touching about 5 files or fewer: a bug fix, a typo, copy, style, config or docs edit, or a small addition to an existing feature. No new data model, state design or public API.",
+      "stages": {
+        "plan": false,
+        "implement": "self",
+        "test": false,
+        "verify": "ui",
+        "design": "off",
+        "review": false,
+        "fixRounds": 1
+      }
+    },
+    {
+      "id": "medium",
+      "label": "Medium",
+      "description": "A feature or fix across one or two areas, roughly 5 to 15 files, that adds or changes behaviour worth its own tests and a code review. It is still one coherent change: it does not split into parallel parts and needs no new design for state, data model, concurrency or persistence.",
+      "stages": {
+        "plan": false,
+        "implement": "self",
+        "test": true,
+        "verify": "ui",
+        "design": "ui",
+        "review": true,
+        "fixRounds": 1
+      }
+    },
+    {
+      "id": "large",
+      "label": "Large",
+      "description": "Complex and broad work where at least two of these hold: 3 or more issues, or changes across several packages or areas that can run as parallel lanes; a new design for state, data model, concurrency or persistence; roughly 15 or more files or 500 or more changed lines. One area or a long task alone is not enough.",
+      "stages": {
+        "plan": true,
+        "implement": "agents",
+        "test": true,
+        "verify": "ui",
+        "design": "ui",
+        "review": true,
+        "fixRounds": 2
+      }
+    }
+  ],
+  "decisions": {
+    "model": "jev-1.13.0",
+    "timeoutMs": 4000,
+    "points": {
+      "level": {
+        "enabled": true,
+        "minConfidence": 0.4,
+        "question": "This is a coding task for an AI coding agent. Which level of process does it need? Judge the scope of the change it asks for: how many areas and files it touches, whether it needs a new design, and whether it splits into parallel parts."
+      },
+      "recipe": {
+        "enabled": true,
+        "minConfidence": 0.5,
+        "question": "This is a coding task for an AI coding agent. Which saved recipe covers it? A recipe covers the task only when the task is the kind of work the recipe's title describes.",
+        "none": "No saved recipe covers this task."
+      },
+      "ui": {
+        "enabled": true,
+        "minConfidence": 0.5,
+        "question": "These are the changed files and the commit subjects of a finished coding task. Did the task change anything a user sees or interacts with in an app's user interface?",
+        "yes": "Yes: it changes screens, pages, components, styles, layout, visible text or interaction in an app's user interface.",
+        "no": "No: it changes only back-end code, data, tooling, scripts, tests, docs or configuration, with nothing visible in an app's user interface."
+      }
+    }
+  }
+}
