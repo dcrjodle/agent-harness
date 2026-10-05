@@ -77,8 +77,11 @@ function makeEvent(kind, sessionId, fields = {}, at = new Date()) {
       return isId(fields.agent_id) && role ? { ...e, agent_id: fields.agent_id, role, label: clip(fields.label, LIMIT.label) } : null;
     }
     case "agent_label": {
+      // `role` (the spawn's subagent_type) only when known: with it the label can create the agent's row.
       const label = clip(fields.label, LIMIT.label);
-      return isId(fields.agent_id) && label ? { ...e, agent_id: fields.agent_id, label } : null;
+      const role = clip(fields.role, LIMIT.role);
+      if (!isId(fields.agent_id) || !label) return null;
+      return role ? { ...e, agent_id: fields.agent_id, role, label } : { ...e, agent_id: fields.agent_id, label };
     }
     case "agent_stop":
       return isId(fields.agent_id) ? { ...e, agent_id: fields.agent_id } : null;
@@ -198,7 +201,8 @@ function credentials() {
 // ---------- writes ----------
 
 // One event's requests, in order. U (create the session row, ignored when it exists) goes first, once
-// per session per flush run, for the kinds that may create the row: session, agent_start and decision.
+// per session per flush run, for the events that may create a row: session, agent_start, decision and an
+// agent_label with a role.
 function requests(e, ensured) {
   const sid = e.session_id;
   const touch = (body) => ({ method: "PATCH", path: `cockpit_sessions?id=eq.${sid}`, body });
@@ -228,8 +232,16 @@ function requests(e, ensured) {
       if (e.label !== null) agent.label = e.label;
       return [...ensure(), upsert("cockpit_agents", "id", agent), touch({ last_at: e.at, ended_at: null })];
     }
-    case "agent_label":
-      return [{ method: "PATCH", path: `cockpit_agents?id=eq.${e.agent_id}`, body: { label: e.label } }, touch({ last_at: e.at })];
+    case "agent_label": {
+      // SubagentStart and the PostToolUse of a background spawn fire together, so the label can come
+      // before the agent's start. With the role it creates the row when it is missing (an existing row
+      // stays as it is), then sets the label; agent_start never sends a null label, so it cannot clear it.
+      const setLabel = { method: "PATCH", path: `cockpit_agents?id=eq.${e.agent_id}`, body: { label: e.label } };
+      if (!e.role) return [setLabel, touch({ last_at: e.at })];
+      const agent = { id: e.agent_id, session_id: sid, role: e.role, started_at: e.at, ended_at: null, status: "running" };
+      const create = { method: "POST", path: "cockpit_agents?on_conflict=id", prefer: "resolution=ignore-duplicates, return=minimal", body: agent };
+      return [...ensure(), create, setLabel, touch({ last_at: e.at })];
+    }
     case "agent_stop":
       return [{ method: "PATCH", path: `cockpit_agents?id=eq.${e.agent_id}`, body: { ended_at: e.at, status: "done" } }, touch({ last_at: e.at })];
     case "decision": {
@@ -411,8 +423,10 @@ function metaLabel(transcript, agentId) {
 }
 
 // A hook payload → the event it stands for, or null.
-//   SubagentStart → agent_start (label from the agent's meta file)    SubagentStop → agent_stop
-//   PostToolUse of the Agent tool, in the main session → agent_label   SessionEnd → session_end
+//   SubagentStart → agent_start          SubagentStop → agent_stop          SessionEnd → session_end
+//   PostToolUse of the Agent tool, in the main session → agent_label (the description, and the
+//   subagent_type as the role so the label can create the row)
+// The label comes from the PostToolUse: the agent's meta file, read at SubagentStart, is rarely written yet.
 // SubagentStop with an empty agent_type is one of the engine's own side agents, not a spawned one.
 function hookEvent(p) {
   if (!p || typeof p !== "object" || Array.isArray(p) || !isId(p.session_id)) return null;
@@ -423,7 +437,11 @@ function hookEvent(p) {
       break;
     case "PostToolUse":
       if (p.agent_id || (p.tool_name !== "Agent" && p.tool_name !== "Task")) return null;
-      e = makeEvent("agent_label", p.session_id, { agent_id: p.tool_response?.agentId, label: p.tool_input?.description });
+      e = makeEvent("agent_label", p.session_id, {
+        agent_id: p.tool_response?.agentId,
+        role: p.tool_input?.subagent_type,
+        label: p.tool_input?.description,
+      });
       break;
     case "SubagentStop":
       if (typeof p.agent_type !== "string" || !p.agent_type) return null;
