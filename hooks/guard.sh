@@ -77,24 +77,70 @@ esac
 # bin/decide is the harness's only Jev client and bin/session-log the only writer of the session log;
 # both act for the orchestrator, and the harness .env's keys are for these two alone. The rules below
 # read the command roughly as a shell does: code segments split at ; & | ( ) newlines, $( and backticks
-# outside quotes. Quoted text stays in its word (quotes removed, blanks as \037) and heredoc bodies are
-# dropped, so messages and docs are data; a `sh -c` or eval string is code. Text after a closing ),
-# backtick or -c string continues a command, not at command position (marked \036). One awk pass over
-# the lines (bash 3.2 string handling is quadratic on long text); only commands naming bin/decide,
-# bin/session-log or a .env are read.
+# outside quotes, # comments left out. Quoted text stays in its word (quotes removed, blanks as \037), so
+# messages and docs are data; a `sh -c` or eval string is code. A heredoc body is data, except the $( )
+# and backtick spans of an unquoted one, and all of one fed to a shell; the lines of one fed to another
+# interpreter that name a .env, Jev or Supabase come out marked \035. Text after a closing ), backtick or
+# -c string continues a command, not at command position (marked \036), unless the $( or backtick sat in
+# the command's leading words (an assignment, a wrapper or the command word): then the command goes on,
+# the substitution read as $_. One awk pass over the lines (bash 3.2 string handling is quadratic on long
+# text); only commands naming bin/decide, bin/session-log or a .env are read.
 split_awk='
 BEGIN {
-  US = "\037"; CT = "\036"; M = "\034"; q = 0
+  US = "\037"; CT = "\036"; GS = "\035"; M = "\034"; q = 0; wb = 1
   SHC = "(^|[ \t/])((ba|da|z|k)?sh([ \t]+-[A-Za-z]+)*[ \t]+-[A-Za-z]*c|eval)[ \t]*$"
+  ASG = "[A-Za-z_][A-Za-z0-9_]*=[^ \t]*"
+  WRAP = "([^ \t]*/)?(env|exec|command|builtin|time|nohup|sudo|doas|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)([ \t]+(-[^ \t]*|[0-9][^ \t]*))*"
+  LEAD = "^[ \t(!{]*((" ASG "|" WRAP "|if|then|do|else|elif|while|until)[ \t]+)*(node([ \t]+-[^ \t]*)*[ \t]+)?[^ \t]*$"
+  LEAD1 = "^[ \t(!{]*([A-Za-z_][A-Za-z0-9_]*=|([^ \t]*/)?(env|exec|command|builtin|time|nohup|sudo|doas|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf|node|if|then|do|else|elif|while|until)([ \t]|$))"
+  HEAD = "^[ \t(!{]*((" ASG "|" WRAP ")[ \t]+)*([^ \t]*/)?"
+  SHELL = HEAD "(ba|da|z|k)?sh([ \t]|$)"
+  INTERP = HEAD "(node|nodejs|deno|bun|bunx|npx|tsx|ts-node|python[0-9.]*|pypy[0-9.]*|uv|uvx|ruby|perl|php|lua|osascript|Rscript|pwsh)([ \t]|$)"
+  TOK = "[^ \t\"`(),;=+<>|&" SQ "]*[.]env([^A-Za-z0-9_.-]|$)"
+  KEEP = "[.]env|--env-file|cd|source|[.][ \t]|bin/decide|bin/session-log|export"
+  JEV = "typesafe|systemone|supabase|rest/v1"
 }
-function push() { if (seg != "" && seg != CT) print seg; seg = "" }
-function data(s) { if (q) gsub(/[ \t]/, US, s); seg = seg s }
-function lit(c) { seg = seg (c == " " || c == "\t" ? US : c) }
+# A segment no rule below can read (it names none of their words) is left out.
+function push() { if (seg != "" && seg != CT && (seg ~ KEEP || tolower(seg) ~ JEV)) print seg; seg = "" }
+function cstart(s, at) { # where a # comment starts in code text s (at: s starts a word), else 0
+  if (at && substr(s, 1, 1) == "#") return 1
+  return match(s, /[ \t]#/) ? RSTART + 1 : 0
+}
+# A line of a heredoc fed to an interpreter, for the key rule: each new word naming a .env (and the
+# harness .env, when the line also names .agent-harness) comes out once, marked GS, and so does the first
+# line naming Jev or Supabase.
+function envline(s,  w, h) {
+  if (!bj && tolower(s) ~ JEV) { bj = 1; print GS tolower(s) }
+  if (!index(s, ".env")) return
+  h = index(s, ".agent-harness")
+  while (match(s, TOK)) {
+    w = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+    if (w !~ /v$/) w = substr(w, 1, length(w) - 1)
+    if (w != ".env" && w !~ /\/[.]env$/) continue
+    if (h && !ES["/.agent-harness/.env"]++) print GS "/.agent-harness/.env"
+    if (!ES[w]++) print GS w
+  }
+}
+function data(s) { if (q == 3) return; if (q) gsub(/[ \t]/, US, s); seg = seg s }
+function lit(c) { if (q != 3) seg = seg (c == " " || c == "\t" ? US : c) }
 function lead(k) { return k <= n ? substr(P[k], 1, 1) : "" }
-function heredoc(  r, w, k, d) { # "<" then P[i] starts with "<": a here-string, a heredoc or "<<"
-  r = substr(P[i], 2)
+# What a $( or backtick that opens now leaves when it closes: the command so far and $_ when the
+# substitution sits in its leading words, else "" (the rest continues an argument). Past 512 bytes, a
+# segment that starts with such words is read as it is now, and goes on as its first and last 128 bytes
+# joined by an assignment, so that a long chain stays short.
+function opening(  s) {
+  if (q == 3 || seg == CT) return ""
+  if (length(seg) <= 512) return seg ~ LEAD ? seg "$_" : ""
+  if (substr(seg, 1, 64) !~ LEAD1) return ""
+  s = substr(seg, 1, 128) "Z=$_" substr(seg, length(seg) - 127)
+  if (s !~ LEAD) return ""
+  push()
+  return s "$_"
+}
+function heredoc(  r, w, k, d, quoted) { # "<" then P[i] starts with "<": a here-string, a heredoc or "<<"
+  r = substr(P[i], 2); quoted = 1
   if (r == "" && lead(i + 1) == "<") { seg = seg "<<<"; rest = substr(P[i + 1], 2); i += 2; return }
-  if (match(r, /^-?[ \t]*[A-Za-z_][A-Za-z0-9_]*/)) { w = substr(r, 1, RLENGTH); rest = substr(r, RLENGTH + 1); i++ }
+  if (match(r, /^-?[ \t]*[A-Za-z_][A-Za-z0-9_]*/)) { w = substr(r, 1, RLENGTH); rest = substr(r, RLENGTH + 1); i++; quoted = 0 }
   else if (r ~ /^-?[ \t]*$/ && (d = lead(i + 1)) != "" && index("\\\"" SQ, d)) { # an escaped or quoted word
     k = i + 1; w = substr(P[k], 2)
     if (d == "\\" && match(w, /^[A-Za-z_][A-Za-z0-9_]*/)) { rest = substr(w, RLENGTH + 1); w = substr(w, 1, RLENGTH); i = k + 1 }
@@ -102,30 +148,64 @@ function heredoc(  r, w, k, d) { # "<" then P[i] starts with "<": a here-string,
     else { seg = seg "<<"; rest = r; i++; return }
   }
   else { seg = seg "<<"; rest = r; i++; return }
-  sub(/^-?[ \t]*/, "", w); hd = w; seg = seg "<<" w
+  # The body: 0 data, 1 data but for its $( ) and backtick spans (unquoted), 2 code (fed to a shell).
+  sub(/^-?[ \t]*/, "", w); hd = w; hm = seg ~ SHELL ? 2 : quoted ? 0 : 1; hi = seg ~ INTERP; seg = seg "<<" w
 }
 {
-  if (body != "") { t = $0; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t); if (t == body) body = ""; next }
-  line = $0; gsub(/\034/, "", line); gsub(/[;&|()<"`$\\]/, M "&", line); gsub(SQ, M SQ, line)
-  n = split(line, P, M); cont = 0; i = 1
-  while (i <= n) { # q: 0 code, 1 in single quotes, 2 in double quotes; stack: the q each $( and ( returns to
+  if (body != "") { # a heredoc body, up to its delimiter line
+    t = $0; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+    if (t == body) { body = ""; joined = 0; if (bm) { push(); q = 0; stack = bstack; bt = ""; btsv = ""; cq = ""; esc = 0 } next }
+    if (bi) envline($0)
+    if (!bm) next
+  }
+  line = $0; gsub(/\034/, "", line); u = ""
+  for (k = 1; k <= length(line); k += 16384) { # in 16 KB parts: gsub slows down with many matches on one long string
+    s = substr(line, k, 16384); gsub(/[;&|()<"`$\\]/, M "&", s); gsub(SQ, M SQ, s); u = u s
+  }
+  n = split(u, P, M); cont = 0; cmt = 0; i = 1; wb = joined ? wbn : 1; joined = 0
+  while (i <= n) { # q: 0 code, 1 single quotes, 2 double quotes, 3 heredoc text; stack: the q each $( and ( returns to
     c = i == 1 ? "" : substr(P[i], 1, 1); rest = i == 1 ? P[i] : substr(P[i], 2); i++
-    if (esc) { esc = 0; lit(c); c = "" }
+    if (cmt) { # a comment runs to the end of the line, or to the end of the backtick or -c string it is in
+      if (cend == "" || c != cend) { if (c == "\\" && rest == "" && cend != SQ) i++; continue }
+      cmt = 0
+    }
+    b = c == "" ? -1 : 0 # for a piece that adds no text: 1 when a new word starts after it (wb, for #)
+    if (esc) { esc = 0; lit(c); c = ""; b = 0 }
     if (c == "") ;
     else if (q == 1) { if (c == SQ) q = 0; else data(c) }
     else if (c == "\\") { if (rest != "") { lit(substr(rest, 1, 1)); rest = substr(rest, 2) } else if (i <= n) esc = 1; else cont = 1 }
-    else if (c == "$") { if (rest == "" && lead(i) == "(") { stack = q stack; q = 0; push(); rest = substr(P[i], 2); i++ } else data(c) }
-    else if (c == "`") { push(); if (bt == "") { bt = q ""; q = 0 } else { q = bt + 0; bt = ""; seg = CT } }
+    else if (c == "$") {
+      if (rest == "" && lead(i) == "(") {
+        d = length(stack) + 1; sv[d] = opening(); sk[d] = "$"; if (sv[d] == "") push(); else seg = ""
+        stack = q stack; q = 0; rest = substr(P[i], 2); i++; b = 1
+      } else data(c)
+    }
+    else if (c == "`") {
+      if (bt == "") { btsv = opening(); if (btsv == "") push(); else seg = ""; bt = q ""; q = 0; b = 1 }
+      else { push(); q = bt + 0; bt = ""; seg = btsv != "" ? btsv : CT; btsv = "" }
+    }
+    else if (q == 3) ;
     else if (q == 2) { if (c == "\"") q = 0; else data(c) }
-    else if (c == SQ || c == "\"") { if (c == cq) { cq = ""; push(); seg = CT } else if (cq == "" && seg ~ SHC) { cq = c; push() } else q = c == SQ ? 1 : 2 }
+    else if (c == SQ || c == "\"") { if (c == cq) { cq = ""; push(); seg = CT } else if (cq == "" && seg ~ SHC) { cq = c; push(); b = 1 } else q = c == SQ ? 1 : 2 }
     else if (c == "<") { if (rest == "" && lead(i) == "<") heredoc(); else data(c) }
-    else if (c == ")") { push(); if (stack != "") { q = substr(stack, 1, 1) + 0; stack = substr(stack, 2); seg = CT } }
-    else { if (c == "(") stack = "0" stack; push() }
-    if (rest != "") data(rest)
+    else if (c == ")") {
+      push(); b = 1
+      if (stack != "") { d = length(stack); q = substr(stack, 1, 1) + 0; stack = substr(stack, 2); seg = sv[d] != "" ? sv[d] : CT; if (sk[d] == "$") b = 0; sv[d] = sk[d] = "" }
+    }
+    else { if (c == "(") { stack = "0" stack; sv[length(stack)] = ""; sk[length(stack)] = "(" } push(); b = 1 }
+    if (rest == "") { if (b >= 0) wb = b; continue }
+    if (q == 0 && index(rest, "#") && (k = cstart(rest, b >= 0 ? b : wb))) { # a comment starts in this text
+      data(substr(rest, 1, k - 1)); cmt = 1; cend = cq != "" ? cq : bt != "" ? "`" : ""; continue
+    }
+    data(rest); wb = rest ~ /[ \t]$/
   }
-  if (cont) seg = seg (q ? US : " ")
+  if (q == 3) { cont = 0; push() }
+  else if (cont) { joined = 1; wbn = seg == "" || seg == CT || substr(seg, length(seg)) ~ /[ \t]/ } # bash drops a backslash-newline
   else if (q) seg = seg US
-  else { push(); if (hd != "") { body = hd; hd = "" } }
+  else {
+    push()
+    if (hd != "") { body = hd; bm = hm; bi = hi; hd = ""; bj = 0; split("", ES); if (bm) { bstack = stack; stack = ""; q = bm == 1 ? 3 : 0 } }
+  }
 }
 END { push() }
 '
@@ -158,11 +238,33 @@ harness_env() { # $1 a path as written, $2 the dir it is relative to → 0 when 
   d=${p%/*}
   live_dir "${d:-/}"
 }
+env_named() { # $1 an interpreter's code → 0 when it names the live harness .env (also built from parts)
+  local s=$1
+  case $s in *.agent-harness*) [[ $s =~ $envname_re ]] && return 0 ;; esac
+  while [[ $s =~ $envtok_re ]]; do
+    harness_env "${BASH_REMATCH[1]}" "$wd" && return 0
+    s=${BASH_REMATCH[3]}
+  done
+  return 1
+}
+env_redirect() { # $1 a segment → 0 when a < redirect, $(< …) too, reads the live harness .env
+  local s=$1
+  while [[ $s =~ $redir_re ]]; do
+    harness_env "${BASH_REMATCH[2]}" "$wd" && return 0
+    s=${BASH_REMATCH[3]}
+  done
+  return 1
+}
 
-nl=$'\n' us=$'\037' rs=$'\036'
+nl=$'\n' us=$'\037' rs=$'\036' gs=$'\035'
 var_re="[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*"
 wrap_re="([^[:space:]]*/)?(env|exec|command|builtin|time|nohup|sudo|doas|nice|ionice|timeout|gtimeout|xargs|caffeinate|stdbuf)([[:space:]]+(-[^[:space:]]*|[0-9][^[:space:]]*))*"
-lead_re="^[[:space:](!{]*((${var_re}|${wrap_re}|if|then|do|else|elif|while|until)[[:space:]]+)*(node([[:space:]]+-[^[:space:]]*)*[[:space:]]+)?[^[:space:]]*"
+lead0="^[[:space:](!{]*((${var_re}|${wrap_re}|if|then|do|else|elif|while|until)[[:space:]]+)*"
+lead_re="${lead0}(node([[:space:]]+-[^[:space:]]*)*[[:space:]]+)?[^[:space:]]*"
+interp_re="${lead0}([^[:space:]]*/)?(node|nodejs|deno|bun|bunx|npx|tsx|ts-node|python[0-9.]*|pypy[0-9.]*|uv|uvx|ruby|perl|php|lua|osascript|Rscript|pwsh)([[:space:]]|\$)"
+envtok_re="([^[:space:]${us}'\"\`(),;=+<>|&]*\\.env)([^A-Za-z0-9_.-]|\$)(.*)"
+envname_re="(^|[^A-Za-z0-9_])\\.env([^A-Za-z0-9_.-]|\$)"
+redir_re="(^|[^<])<[[:space:]]*([^[:space:]${us}<>&|;()]+)(.*)"
 decide_re="${lead_re}bin/decide([[:space:]]|\$)"
 log_re="${lead_re}bin/session-log([[:space:]]|\$)"
 source_re="^[[:space:](!{]*((${var_re}|${wrap_re}|if|then|do|else|elif|while|until)[[:space:]]+)*(source|\\.)[[:space:]]+([^[:space:]]+)"
@@ -175,6 +277,20 @@ loopback_re='^https?://(localhost|127\.[0-9.]+|\[::1\])([:/]|$)'
 segs=() points="" logs="" exports="" loads="" wd="$cwd"
 case "$cmd" in *bin/decide*|*bin/session-log*|*.env*) code_segments "$cmd" ;; esac
 for seg in "${segs[@]}"; do
+  case $seg in "$gs"*) # a line of a heredoc fed to an interpreter
+    if [ -z "$loads" ] && env_named "${seg#"$gs"}"; then loads=1; fi
+    continue ;;
+  esac
+  case $seg in *.env*)
+    if [ -z "$loads" ]; then
+      case $seg in *'<'*) env_redirect "$seg" && loads=1 ;; esac
+      case $seg in
+        "$rs"*) ;;
+        *node*|*deno*|*bun*|*npx*|*tsx*|*python*|*pypy*|*uv*|*ruby*|*perl*|*php*|*lua*|*osascript*|*Rscript*|*pwsh*)
+          [[ $seg =~ $interp_re ]] && env_named "$seg" && loads=1 ;;
+      esac
+    fi ;;
+  esac
   case $seg in *--env-file*)
     rest=${seg#"$rs"}
     while [[ $rest =~ $envfile_re ]]; do
@@ -230,8 +346,9 @@ if [ -n "$agent" ] && [ -n "$logs" ]; then
 fi
 
 # The harness .env's keys (Jev, Supabase) are only for bin/decide and bin/session-log: a command that
-# loads it (source, . or --env-file, also relative to a cd into it) and names Jev or Supabase in its code
-# is denied. A project's own Jev or Supabase use, with its own .env, is not touched.
+# loads it (source, . or --env-file, also relative to a cd into it; an interpreter naming it in its code
+# or heredoc; a < redirect or $(< …) from it) and names Jev or Supabase in its code is denied. A project's
+# own Jev or Supabase use, with its own .env, is not touched.
 if [ -n "$loads" ] && printf '%s\n' "${segs[@]}" | grep -Eqi 'typesafe|systemone|supabase|rest/v1'; then
   deny "the harness .env's keys are only for bin/decide and bin/session-log; a project calls Jev or Supabase with its own keys."
 fi
