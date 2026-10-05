@@ -18,6 +18,7 @@
 //   <status>:<regex>   requests whose path (with query) matches the regex answer <status>, the others are ok
 //   plain<status>:<regex>  the same with a body that is not JSON
 //   delay:<ms>         the answer comes after <ms>, as ok
+//   redirect:<url>     every request answers 307 with Location: <url>
 //
 // Every request is recorded as { method, path, apikey, authorization, prefer, contentType, headers, raw,
 // body, answered }, `path` being the URL with its query and `answered` the status sent (null when the
@@ -86,6 +87,12 @@ export async function startFakeSupabase({ host = "127.0.0.1" } = {}) {
     const [okStatus, okBody] = okAnswer(req);
 
     if (name === "ok") return reply(res, entry, okStatus, okBody);
+    if (name === "redirect") {
+      entry.answered = 307;
+      res.writeHead(307, { location: arg });
+      res.end();
+      return;
+    }
     if (name === "down") {
       req.socket.destroy();
       return;

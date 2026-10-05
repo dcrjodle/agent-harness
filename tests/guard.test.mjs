@@ -284,6 +284,7 @@ describe("H-D hooks/guard.sh", () => {
           ["decide, with both exported only after it", "bin/decide level x; export HARNESS_DIR=/tmp/h TYPESAFE_BASE_URL=http://127.0.0.1:9999", /orchestrator/],
           ["decide, with only the harness exported before it", "export HARNESS_DIR=/tmp/h; bin/decide level x", /orchestrator/],
           ["session-log, with the harness exported before it", "export HARNESS_DIR=/tmp/h; bin/session-log flush", true],
+          ["session-log, with the harness assigned but not exported (the script would not see it)", "HARNESS_DIR=/tmp/h; bin/session-log flush", /scratch HARNESS_DIR/],
           ["session-log, with the harness exported only after it", "bin/session-log flush; export HARNESS_DIR=/tmp/h", /scratch HARNESS_DIR/],
         ],
         { agent: true },

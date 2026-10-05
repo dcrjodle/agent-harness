@@ -58,6 +58,7 @@ export function baseEnv(home, extra = {}) {
 // Asynchronous on purpose: a fake Jev in this process must keep answering while the child runs.
 export function run(cmd, args, { env, cwd, input, timeoutMs = 60_000 } = {}) {
   return new Promise((resolve, reject) => {
+    if (!env) return reject(new Error(`run(): pass an explicit env (s.env()), never the tester's own: ${cmd}`));
     const started = Date.now();
     const child = spawn(cmd, args, { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";

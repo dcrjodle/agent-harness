@@ -176,6 +176,8 @@ describe("H-A bin/session-log", () => {
       ["a Stop payload", () => ({ hook_event_name: "Stop", session_id: "s1", cwd: acme })],
       ["a PreToolUse payload of the Bash tool", () => ({ hook_event_name: "PreToolUse", session_id: "s1", tool_name: "Bash", tool_input: { command: "ls" }, cwd: acme })],
       ["a PostToolUse payload of another tool", () => labelled({ tool_name: "Bash" })],
+      ["a SubagentStart with an empty agent_type (no role to store)", () => start("a1", { agent_type: "" })],
+      ["a SubagentStart without an agent_type", () => start("a1", { agent_type: undefined })],
       ["a SubagentStart with the agent_id ../x", () => start("../x")],
       ["a SubagentStop with the agent_id ../x", () => stopped({ agent_id: "../x" })],
       ["a PostToolUse whose agentId is ../x", () => labelled({ tool_response: { agentId: "../x" } })],
@@ -321,6 +323,20 @@ describe("H-A bin/session-log", () => {
         assert.equal(q.apikey, jwt);
         assert.equal(q.authorization, `Bearer ${jwt}`);
       }
+    });
+
+    it("never follows a redirect: the key does not leave for another URL, and the event waits", async (t) => {
+      const { fake, h, full } = await setup(t, { secret: false });
+      const elsewhere = await startFakeSupabase();
+      t.after(() => elsewhere.close());
+      quiet(await hook(h, ended()));
+      full();
+      fake.mode(`redirect:${elsewhere.url}${REST}cockpit_sessions`);
+      const r = await flush(h);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, "sent 0, waiting 1, rejected 0\n");
+      assert.equal(fake.requests.length, 1);
+      assert.equal(elsewhere.requests.length, 0, "the redirect target received a request");
     });
 
     it("a URL with a trailing slash still writes under /rest/v1/", async (t) => {
@@ -571,6 +587,16 @@ describe("H-A bin/session-log", () => {
       assert.equal(r.stdout, "supabase: set\nwaiting: 0\nrejected: 0\n");
       fs.rmSync(path.join(h.dir, ".env"));
       assert.equal((await status(h)).stdout, "supabase: missing COCKPIT_SUPABASE_URL, COCKPIT_SUPABASE_SECRET_KEY\nwaiting: 0\nrejected: 0\n");
+    });
+
+    it("reads the keys from a .env with other keys, comments and quotes", async (t) => {
+      const { fake, h } = await setup(t, { url: false, secret: false });
+      h.setEnv(`# keys\nGITHUB_TOKEN=gh\nCOCKPIT_SUPABASE_URL="${fake.url}"\nOPENAI_API_KEY=oa\nCOCKPIT_SUPABASE_SECRET_KEY='${SECRET}'\n`);
+      assert.equal((await status(h)).stdout, "supabase: set\nwaiting: 0\nrejected: 0\n");
+      quiet(await hook(h, ended()));
+      await drained(h);
+      assert.ok(fake.requests.length >= 2);
+      for (const q of fake.requests) assert.equal(q.apikey, SECRET);
     });
 
     it("an empty value counts as missing", async (t) => {

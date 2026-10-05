@@ -164,7 +164,7 @@ describe("H-C hooks/decide-context.sh", () => {
       const h = fresh();
       const bin = path.join(s.root, "nonode-bin");
       fs.mkdirSync(bin, { recursive: true });
-      for (const tool of ["jq", "cat"]) fs.symlinkSync(execFileSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).trim(), path.join(bin, tool));
+      for (const tool of ["jq", "cat"]) fs.symlinkSync(execFileSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8", env: s.env() }).trim(), path.join(bin, tool));
       assert.equal(execFileSync("/bin/sh", ["-c", "command -v node || true"], { encoding: "utf8", env: { PATH: bin } }).trim(), "", "node must not be on this PATH");
       silent(await hook(typed("small fix the readme typo"), { h, env: { PATH: bin } }), "no node");
       assert.equal(fs.existsSync(h.outboxDir), false);
@@ -174,7 +174,7 @@ describe("H-C hooks/decide-context.sh", () => {
       const h = fresh();
       const bin = path.join(s.root, "nojq-bin");
       fs.mkdirSync(bin, { recursive: true });
-      for (const tool of ["node", "cat"]) fs.symlinkSync(execFileSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).trim(), path.join(bin, tool));
+      for (const tool of ["node", "cat"]) fs.symlinkSync(execFileSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8", env: s.env() }).trim(), path.join(bin, tool));
       silent(await hook(typed("small fix the readme typo"), { h, env: { PATH: bin } }), "no jq");
     });
 

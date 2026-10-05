@@ -1,6 +1,7 @@
 // H-E: setup.sh wires the hooks (plan D6, sessions plan S5). It runs from a copy of the harness under a scratch
 // HOME, so the real ~/.claude, ~/.codex and ~/.agent-harness are never touched and this checkout stays clean.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -161,6 +162,13 @@ describe("H-E setup.sh", () => {
         assert.ok(fs.statSync(path.join(copy, file)).mode & 0o111, `setup left ${file} not executable`);
         fs.accessSync(path.join(REPO, file), fs.constants.X_OK);
       }
+    });
+
+    it("the scripts are tracked as executable, so a fresh clone can run them", () => {
+      const r = spawnSync("git", ["-C", REPO, "ls-files", "-s", "--", ...EXECUTABLES], { encoding: "utf8", env: s.env() });
+      assert.equal(r.status, 0, r.stderr);
+      const modes = Object.fromEntries(r.stdout.trim().split("\n").map((line) => [line.split("\t")[1], line.split(" ")[0]]));
+      for (const file of EXECUTABLES) assert.equal(modes[file], "100755", `${file} is tracked as ${modes[file]}`);
     });
 
     it("stage-log and stage-times are gone from the copy", () => {
