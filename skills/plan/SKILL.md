@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Plan a coding task with the harness planner — binding decisions, parallel lanes, acceptance checks. Solve runs it when the level has plan on.
+description: Plan a coding task with the harness planner — binding decisions, parallel lanes, acceptance checks. Solve spawns the planner when the level has plan on.
 argument-hint: "<task>"
 ---
 Spawn the `planner` role (`~/.agent-harness/agents/planner.md`) for: $ARGUMENTS

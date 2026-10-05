@@ -28,10 +28,10 @@ A visual check names the screen, state, viewport widths, themes and the design r
 - `implement agents` → orchestrate only and never read source. Lane 0 runs in the task worktree. When it has committed, fork every other lane: `task-fork <worktree> lane-N`, one implementer per fork, in parallel. When all return: `task-join <worktree> lane-N` for each. A conflict stops the solve: report it.
 
 ## 5. Check
-1. **UI decision** — `verify ui` or `design ui` → run once per task, now: `~/.agent-harness/bin/decide ui <worktree>` prints `ui: yes` or `ui: no`. Later rounds reuse it.
+1. **UI decision** — `verify ui` or `design ui` → run once per task, now: `~/.agent-harness/bin/decide ui <worktree>` prints `ui: yes` or `ui: no`. A non-zero exit (no `<handoff>/base`, not a worktree) counts as `ui: yes`: note it in pr.md. Later rounds reuse it.
 2. **In parallel**, then wait for all; don't edit the worktree meanwhile:
    - `test on` → tester in the task worktree → `test-N.md`;
-   - `verify always`, or `verify ui` with `ui: yes` → verifier in a snapshot (`task-fork <worktree> verify --detach`) → `verify-N.md` and `shots/`; then, with `design ui`, `ui: yes` and a check that names a design reference, the designer → `design-N.md`; `task-join <worktree> verify` when both are done;
+   - `verify always`, or `verify ui` with `ui: yes`, and only with at least one `verify` check in checks.md → verifier in a snapshot (`task-fork <worktree> verify --detach`) → `verify-N.md` and `shots/`; then, with `design ui`, `ui: yes` and a check that names a design reference, the designer → `design-N.md`; `task-join <worktree> verify` when both are done;
    - `review on` → reviewer → `review-N.md`.
 3. **Screenshots** no designer judged: compare `<handoff>/shots/` with the design reference, or the app's existing screens, yourself; differences go to `design-N.md` as findings.
 4. **Status** — `task-status <handoff>` counts open blockers and majors. Zero → ship.
@@ -49,5 +49,6 @@ Every stage file lists findings as `- [ ] <blocker|major|minor|nit> — <where> 
 - One background agent per stage, fresh for every round. A brief is: task or issue refs, worktree, handoff, round N, recipes, commit trailer; paths, never pasted content.
 - Sub-agents never spawn sub-agents.
 - Jev only through `bin/decide`, only at steps 1 and 5.1.
+- The session log is written by hooks and `bin/decide` through `~/.agent-harness/bin/session-log` (Claude Code only); never write it by hand or from a sub-agent.
 - A stage that returns without its file or commits failed: rerun it fresh with the reason.
 - Static checks red after implement → stop and report.
