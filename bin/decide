@@ -1,0 +1,616 @@
+#!/usr/bin/env node
+// decide: the harness's only Jev client (TypeSafe AI, POST /v1/systemone), for three fixed
+// decision points: level and recipe at the start of a solve, ui after implementation.
+// Fixed wording and a pinned model from settings.json, argmax with fixed thresholds and fixed
+// fallbacks, cached answers in logs/decisions/, every decision appended to logs/decisions.jsonl.
+// Never blocks work: every decision exits 0, fallbacks included; usage and settings errors exit 2.
+// Dir: $HARNESS_DIR or this script's repo. Key: TYPESAFE_API_KEY from <dir>/.env only.
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const util = require("node:util");
+const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
+
+const USAGE = `usage:
+  decide level  [--repo DIR] [--json] [--] TASK...  pick the level for a task
+  decide recipe [--repo DIR] [--json] [--] TASK...  pick one of the repo's cached recipes, or none
+  decide ui     [--base REV] [--json] WORKTREE      did the task change a UI (base: <WORKTREE>.handoff/base)
+  decide start  [--repo DIR] [--json] [--] TASK...  level, then recipe when the repo has recipes
+  decide stages [--json] LEVEL                      a level's stages, without Jev
+  decide check  [FILE]                              validate settings.json
+`;
+
+const SCRIPT_ROOT = path.dirname(path.dirname(fs.realpathSync(__filename)));
+const DIR = process.env.HARNESS_DIR ? path.resolve(process.env.HARNESS_DIR) : SCRIPT_ROOT;
+const LOGS = path.join(DIR, "logs");
+const STAGE_KEYS = ["plan", "implement", "test", "verify", "design", "review", "fixRounds"];
+const RETRY_DELAY_MS = 250;
+const RETRY_MIN_LEFT_MS = 1000;
+const MAX_PATHS = 300;
+const MAX_COMMITS = 100;
+
+class Exit extends Error {
+  constructor(code, out, err) {
+    super(err || out);
+    Object.assign(this, { code, out, err });
+  }
+}
+const usage = (msg) => {
+  throw new Exit(2, "", `decide: ${msg}\n${USAGE}`);
+};
+const fail = (msg) => {
+  throw new Exit(2, "", `decide: ${msg}\n`);
+};
+const warn = (msg) => {
+  try {
+    fs.writeSync(2, `decide: ${msg}\n`);
+  } catch {}
+};
+
+// ---------- settings and their schema ----------
+
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const kindOf = (v) =>
+  v === null ? "null" : Array.isArray(v) ? "array" : typeof v === "number" ? (Number.isInteger(v) ? "integer" : "number") : typeof v;
+const same = (a, b) => a === b || (typeof a === "object" && typeof b === "object" && JSON.stringify(a) === JSON.stringify(b));
+
+// The subset of JSON Schema 2020-12 that settings.schema.json uses, plus uniqueItemProperties.
+function validate(s, v, at, errs) {
+  if (s === true) return;
+  if (s === false) return void errs.push([at, "not allowed"]);
+  const kind = kindOf(v);
+  if (s.type !== undefined) {
+    const types = [].concat(s.type);
+    if (!types.some((t) => t === kind || (t === "number" && kind === "integer"))) return void errs.push([at, `must be ${types.join(" or ")}`]);
+  }
+  if (hasOwn(s, "const") && !same(v, s.const)) return void errs.push([at, `must be ${JSON.stringify(s.const)}`]);
+  if (s.enum && !s.enum.some((e) => same(v, e))) return void errs.push([at, `must be one of ${s.enum.map((e) => JSON.stringify(e)).join(", ")}`]);
+  if (kind === "integer" || kind === "number") {
+    if (s.minimum !== undefined && v < s.minimum) errs.push([at, `must be >= ${s.minimum}`]);
+    if (s.maximum !== undefined && v > s.maximum) errs.push([at, `must be <= ${s.maximum}`]);
+  } else if (kind === "string") {
+    const n = [...v].length;
+    if (s.minLength !== undefined && n < s.minLength) errs.push([at, `must have at least ${s.minLength} characters`]);
+    if (s.maxLength !== undefined && n > s.maxLength) errs.push([at, `must have at most ${s.maxLength} characters`]);
+    if (s.pattern !== undefined && !new RegExp(s.pattern, "u").test(v)) errs.push([at, `must match ${s.pattern}`]);
+  } else if (kind === "array") {
+    if (s.minItems !== undefined && v.length < s.minItems) errs.push([at, `must have at least ${s.minItems} items`]);
+    if (s.maxItems !== undefined && v.length > s.maxItems) errs.push([at, `must have at most ${s.maxItems} items`]);
+    if (s.items !== undefined) v.forEach((x, i) => validate(s.items, x, [...at, i], errs));
+    for (const key of s.uniqueItemProperties || []) {
+      const seen = new Set();
+      v.forEach((x, i) => {
+        if (kindOf(x) !== "object" || !hasOwn(x, key)) return;
+        const id = JSON.stringify(x[key]);
+        if (seen.has(id)) errs.push([[...at, i, key], `duplicates ${id}`]);
+        seen.add(id);
+      });
+    }
+  } else if (kind === "object") {
+    const props = s.properties || {};
+    for (const key of s.required || []) if (!hasOwn(v, key)) errs.push([[...at, key], "missing"]);
+    if (s.additionalProperties !== undefined) {
+      for (const key of Object.keys(v)) {
+        if (hasOwn(props, key)) continue;
+        if (s.additionalProperties === false) errs.push([[...at, key], "unknown key"]);
+        else validate(s.additionalProperties, v[key], [...at, key], errs);
+      }
+    }
+    for (const key of Object.keys(props)) if (hasOwn(v, key)) validate(props[key], v[key], [...at, key], errs);
+  }
+  if (s.if !== undefined) {
+    const e = [];
+    validate(s.if, v, at, e);
+    if (e.length === 0) {
+      if (s.then !== undefined) validate(s.then, v, at, errs);
+    } else if (s.else !== undefined) validate(s.else, v, at, errs);
+  }
+}
+
+function jsonPath(at) {
+  if (at.length === 0) return "$";
+  let out = "";
+  for (const seg of at) {
+    if (typeof seg === "number") out += `[${seg}]`;
+    else if (/^[A-Za-z_$][\w$]*$/.test(seg)) out += out ? `.${seg}` : seg;
+    else out += `[${JSON.stringify(seg)}]`;
+  }
+  return out;
+}
+
+// → { doc } | { missing: true, problem } | { problem: "<json path>: <problem>" }
+function readSettings(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    return { missing: e.code === "ENOENT", problem: `$: cannot read ${file} (${e.code || e.message})` };
+  }
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (e) {
+    return { problem: `$: invalid JSON (${e.message})` };
+  }
+  const schemaFile = path.join(SCRIPT_ROOT, "settings.schema.json");
+  let schema;
+  try {
+    schema = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
+  } catch (e) {
+    fail(`cannot read ${schemaFile} (${e.code || e.message})`);
+  }
+  const errs = [];
+  validate(schema, doc, [], errs);
+  return errs.length ? { problem: `${jsonPath(errs[0][0])}: ${errs[0][1]}` } : { doc };
+}
+
+function loadSettings() {
+  const file = path.join(DIR, "settings.json");
+  const r = readSettings(file);
+  if (r.missing) fail(`no settings.json at ${file}`);
+  if (r.problem) fail(`${file}: ${r.problem}`);
+  return r.doc;
+}
+
+const stagesOf = (level) => Object.fromEntries(STAGE_KEYS.map((k) => [k, level.stages[k]]));
+const onOff = (b) => (b ? "on" : "off");
+const stagesText = (st) =>
+  `plan ${onOff(st.plan)}, implement ${st.implement}, test ${onOff(st.test)}, verify ${st.verify}, ` +
+  `design ${st.design}, review ${onOff(st.review)}, fix rounds ${st.fixRounds}`;
+
+// A level id, or the legacy inline (first level) and loop (last level).
+function findLevel(levels, word) {
+  const w = word.toLowerCase();
+  if (w === "inline") return levels[0];
+  if (w === "loop") return levels[levels.length - 1];
+  return levels.find((l) => l.id === w) || null;
+}
+
+// ---------- inputs ----------
+
+// NFC, CRLF → LF, whitespace runs → one space, lines trimmed, at most one blank line, trimmed.
+function normalize(text) {
+  return String(text)
+    .normalize("NFC")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+// A first word (lowercased, trailing ":" or "," cut) naming a level overrides Jev; the rest is the task.
+function parseTask(words, levels) {
+  const text = normalize(words.join(" "));
+  const m = /^(\S+)\s*([\s\S]*)$/.exec(text);
+  const level = m ? findLevel(levels, m[1].replace(/[:,]+$/, "")) : null;
+  return { text, override: level ? level.id : null, rest: level ? normalize(m[2]) : text };
+}
+
+function git(dir, args) {
+  try {
+    return execFileSync("git", ["--no-optional-locks", "-C", dir, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+}
+
+// The main checkout folder's name, as in bin/_lib.sh harness_repo_name.
+function repoName(dir) {
+  const common = (git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) || "").trim();
+  return common ? path.basename(path.dirname(common)) : null;
+}
+
+// cache/recipes/<repo>/*.md sorted by name; the title is line 1 without "# ".
+function listRecipes(repo) {
+  if (!repo || repo === "." || repo === "..") return [];
+  const folder = path.join(DIR, "cache", "recipes", repo);
+  let files;
+  try {
+    files = fs.readdirSync(folder);
+  } catch {
+    return [];
+  }
+  const recipes = [];
+  for (const file of files) {
+    const name = file.slice(0, -3);
+    if (!file.endsWith(".md") || file.startsWith(".") || !name || name === "none") continue;
+    const full = path.join(folder, file);
+    let first;
+    try {
+      if (!fs.statSync(full).isFile()) continue;
+      first = fs.readFileSync(full, "utf8").split(/\r?\n/, 1)[0];
+    } catch {
+      continue;
+    }
+    recipes.push({ name, title: first.replace(/^#\s*/, "").trim() || name, file: full });
+  }
+  return recipes.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+// ---------- decision points ----------
+
+function levelSpec(settings, task) {
+  const ids = settings.levels.map((l) => l.id);
+  return {
+    point: "level",
+    kind: "choice",
+    options: ids,
+    pairs: settings.levels.map((l) => [l.id, l.description]),
+    input: task.text,
+    override: task.override,
+    // The more thorough of the top two; without an answer (uniform) that is the second level.
+    fallback: (probs) => ids[Math.max(...rank(ids, probs).slice(0, 2))],
+  };
+}
+
+function recipeSpec(settings, task, recipes) {
+  const none = settings.decisions.points.recipe.none;
+  return {
+    point: "recipe",
+    kind: "choice",
+    options: ["none", ...recipes.map((r) => r.name)],
+    pairs: [["none", none], ...recipes.map((r) => [r.name, r.title])],
+    input: task.rest,
+    noRecipes: recipes.length === 0,
+    fallback: () => "none",
+  };
+}
+
+function uiSpec(settings, state) {
+  const { yes, no } = settings.decisions.points.ui;
+  return { point: "ui", kind: "noul", options: ["yes", "no"], pairs: [["yes", yes], ["no", no]], input: state, fallback: () => "yes" };
+}
+
+// Option indexes by probability, highest first; ties keep option order. No answer = uniform.
+function rank(options, probs) {
+  const idx = options.map((_, i) => i);
+  return probs ? idx.sort((a, b) => probs[options[b]] - probs[options[a]] || a - b) : idx;
+}
+
+const round4 = (x) => Math.round(x * 1e4) / 1e4;
+const isProb = (p) => typeof p === "number" && Number.isFinite(p) && p >= 0 && p <= 1;
+
+async function runPoint(settings, spec, repo) {
+  const cfg = settings.decisions.points[spec.point];
+  const d = {
+    point: spec.point,
+    value: null,
+    confidence: null,
+    probabilities: null,
+    source: "fallback",
+    reason: null,
+    model: null,
+    inputHash: `sha256:${sha256(spec.input)}`,
+    repo,
+    ms: 0,
+  };
+  if (spec.override) return { ...d, value: spec.override, source: "override", reason: "first-word" };
+  if (spec.noRecipes) return { ...d, value: spec.fallback(null), reason: "no-recipes" };
+  if (!cfg.enabled) return { ...d, value: spec.fallback(null), reason: "disabled" };
+
+  const model = settings.decisions.model;
+  const key = sha256(JSON.stringify([spec.point, model, cfg.question, spec.pairs, spec.input]));
+  const cacheFile = path.join(LOGS, "decisions", `${spec.point}-${key}.json`);
+  const cached = readCache(cacheFile, spec.options);
+  if (cached) return judge(d, spec, cfg, cached.probabilities, cached.model, "cache", 0);
+
+  const apiKey = readKey();
+  if (!apiKey) return { ...d, value: spec.fallback(null), reason: "no-key" };
+  const res = await askJev(apiKey, settings.decisions.timeoutMs, requestBody(model, cfg.question, spec));
+  if (res.reason) return { ...d, value: spec.fallback(null), reason: res.reason, ms: res.ms };
+  const probs = answerProbabilities(res.data, spec);
+  if (!probs) return { ...d, value: spec.fallback(null), reason: "bad-response", ms: res.ms };
+  const answering = typeof res.data.model === "string" && res.data.model ? res.data.model : model;
+  writeCache(cacheFile, { v: 1, point: spec.point, model: answering, probabilities: probs });
+  return judge(d, spec, cfg, probs, answering, "jev", res.ms);
+}
+
+// Argmax (Jev's own choice and confidence are ignored); confidence = (n * pmax - 1) / (n - 1).
+function judge(d, spec, cfg, probs, model, source, ms) {
+  const n = spec.options.length;
+  const top = rank(spec.options, probs)[0];
+  const pmax = probs[spec.options[top]];
+  const confidence = round4(n > 1 ? Math.min(1, Math.max(0, (n * pmax - 1) / (n - 1))) : 1);
+  const probabilities = Object.fromEntries(spec.options.map((o) => [o, round4(probs[o])]));
+  const out = { ...d, confidence, probabilities, model, ms };
+  if (confidence < cfg.minConfidence) return { ...out, value: spec.fallback(probs), source: "fallback", reason: "low-confidence" };
+  return { ...out, value: spec.options[top], source, reason: "argmax" };
+}
+
+function requestBody(model, question, spec) {
+  const q =
+    spec.kind === "noul"
+      ? { type: "noul", instructions: question, criteria: { true: spec.pairs[0][1], false: spec.pairs[1][1] } }
+      : { type: "choice", instructions: question, criteria: Object.fromEntries(spec.pairs) };
+  return { model, state: spec.input, questions: { [spec.point]: q } };
+}
+
+// Probabilities per option from an answer, or null when it is not a valid answer.
+function answerProbabilities(data, spec) {
+  const answers = data && typeof data === "object" ? data.answers : null;
+  const a = answers && typeof answers === "object" && hasOwn(answers, spec.point) ? answers[spec.point] : null;
+  if (!a || typeof a !== "object") return null;
+  if (spec.kind === "noul") return isProb(a.noul) ? { yes: a.noul, no: 1 - a.noul } : null;
+  const p = a.probabilities;
+  if (!p || typeof p !== "object" || !spec.options.every((o) => hasOwn(p, o) && isProb(p[o]))) return null;
+  return Object.fromEntries(spec.options.map((o) => [o, p[o]]));
+}
+
+function readCache(file, options) {
+  try {
+    const c = JSON.parse(fs.readFileSync(file, "utf8"));
+    const p = c && c.probabilities;
+    if (typeof c.model !== "string" || !p || typeof p !== "object" || !options.every((o) => hasOwn(p, o) && isProb(p[o]))) return null;
+    return { model: c.model, probabilities: Object.fromEntries(options.map((o) => [o, p[o]])) };
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(file, entry) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify(entry)}\n`);
+    fs.renameSync(tmp, file);
+  } catch {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+  }
+}
+
+// Only TYPESAFE_API_KEY, only from <dir>/.env; the process environment is ignored.
+function readKey() {
+  if (typeof util.parseEnv !== "function") return null;
+  try {
+    const value = util.parseEnv(fs.readFileSync(path.join(DIR, ".env"), "utf8")).TYPESAFE_API_KEY;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// One attempt within timeoutMs; one retry after 250 ms on 429, 5xx or a network error when
+// at least 1000 ms of the budget would be left. → { data, ms } | { reason, ms }
+async function askJev(apiKey, timeoutMs, body) {
+  const base = (process.env.TYPESAFE_BASE_URL || "").trim() || "https://api.typesafe.ai";
+  const url = `${base.replace(/\/+$/, "")}/v1/systemone`;
+  const payload = JSON.stringify(body);
+  const started = Date.now();
+  const deadline = started + timeoutMs;
+  let reason = "network";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const r = await attemptJev(url, apiKey, payload, deadline);
+    if (!r.reason) return { data: r.data, ms: Date.now() - started };
+    reason = r.reason;
+    const retryable = reason === "network" || reason === "http-429" || /^http-5\d\d$/.test(reason);
+    if (attempt === 2 || !retryable || deadline - Date.now() - RETRY_DELAY_MS < RETRY_MIN_LEFT_MS) break;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  }
+  return { reason, ms: Date.now() - started };
+}
+
+async function attemptJev(url, apiKey, payload, deadline) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, Math.max(0, deadline - Date.now()));
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": "agent-harness-decide/1",
+      },
+      body: payload,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      res.body?.cancel().catch(() => {});
+      return { reason: `http-${res.status}` };
+    }
+    const text = await res.text();
+    try {
+      return { data: JSON.parse(text) };
+    } catch {
+      return { reason: "bad-response" };
+    }
+  } catch {
+    return { reason: timedOut ? "timeout" : "network" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------- output ----------
+
+function logLine(d) {
+  return JSON.stringify({
+    v: 1,
+    time: new Date().toISOString(),
+    point: d.point,
+    value: d.value,
+    confidence: d.confidence,
+    probabilities: d.probabilities,
+    source: d.source,
+    reason: d.reason,
+    model: d.model,
+    inputHash: d.inputHash,
+    repo: d.repo,
+    ms: d.ms,
+  });
+}
+
+function appendLog(d) {
+  const line = logLine(d);
+  try {
+    fs.mkdirSync(LOGS, { recursive: true });
+    fs.appendFileSync(path.join(LOGS, "decisions.jsonl"), `${line}\n`);
+  } catch (e) {
+    warn(`could not append to ${path.join(LOGS, "decisions.jsonl")} (${e.code || e.message})`);
+  }
+  return line;
+}
+
+const tag = (d) => `${d.source}, ${d.source === "jev" || d.source === "cache" ? d.confidence.toFixed(2) : d.reason}`;
+
+function emit(d, json) {
+  const line = appendLog(d);
+  return { code: 0, out: json ? `${line}\n` : `${d.point}: ${d.value} (${tag(d)})\n` };
+}
+
+// ---------- commands ----------
+
+// Options come first; the first other argument or "--" ends them.
+function parseOptions(args, valued, flags) {
+  const opts = {};
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      i++;
+      break;
+    }
+    if (!a.startsWith("--")) break;
+    const eq = a.indexOf("=");
+    const name = eq === -1 ? a : a.slice(0, eq);
+    if (flags.includes(name) && eq === -1) opts[name.slice(2)] = true;
+    else if (valued.includes(name)) {
+      const value = eq === -1 ? args[++i] : a.slice(eq + 1);
+      if (!value) usage(`${name} needs a value`);
+      opts[name.slice(2)] = value;
+    } else usage(`unknown option ${a}`);
+  }
+  return { opts, rest: args.slice(i) };
+}
+
+async function taskCommand(cmd, args) {
+  const { opts, rest } = parseOptions(args, ["--repo"], ["--json"]);
+  if (!normalize(rest.join(" "))) usage(`${cmd}: no task`);
+  const settings = loadSettings();
+  const task = parseTask(rest, settings.levels);
+  const repo = repoName(path.resolve(opts.repo || "."));
+
+  if (cmd === "level") return emit(await runPoint(settings, levelSpec(settings, task), repo), opts.json);
+  if (cmd === "recipe") {
+    if (!task.rest) usage("recipe: no task after the level word");
+    return emit(await runPoint(settings, recipeSpec(settings, task, listRecipes(repo)), repo), opts.json);
+  }
+
+  // start: both points at once; recipe only when the repo has recipes and a task is left.
+  const recipes = task.rest ? listRecipes(repo) : [];
+  const [lv, rc] = await Promise.all([
+    runPoint(settings, levelSpec(settings, task), repo),
+    recipes.length ? runPoint(settings, recipeSpec(settings, task, recipes), repo) : null,
+  ]);
+  const lvLine = appendLog(lv);
+  const rcLine = rc ? appendLog(rc) : null;
+  const stages = stagesOf(settings.levels.find((l) => l.id === lv.value));
+  if (opts.json) {
+    return { code: 0, out: `${JSON.stringify({ level: JSON.parse(lvLine), recipe: rcLine && JSON.parse(rcLine), stages })}\n` };
+  }
+  const lines = [
+    "Harness decision for this solve (bin/decide, logged in logs/decisions.jsonl):",
+    `- Level: ${lv.value} (${tag(lv)}). Stages: ${stagesText(stages)}.`,
+  ];
+  if (rc && rc.value === "none") lines.push(`- Recipe: none (${tag(rc)}).`);
+  else if (rc) lines.push(`- Recipe: ${rc.value} (${tag(rc)}): ${recipes.find((r) => r.name === rc.value).file}`);
+  return { code: 0, out: `${lines.join("\n")}\n` };
+}
+
+async function uiCommand(args) {
+  const { opts, rest } = parseOptions(args, ["--base"], ["--json"]);
+  if (rest.length !== 1) usage("ui: give one WORKTREE");
+  const settings = loadSettings();
+  const wt = path.resolve(rest[0]);
+  const top = (git(wt, ["rev-parse", "--show-toplevel"]) || "").trim();
+  if (!top) fail(`ui: ${wt} is not a git worktree`);
+  let base = opts.base;
+  if (!base) {
+    for (const f of [`${wt}.handoff/base`, `${top}.handoff/base`]) {
+      try {
+        base = fs.readFileSync(f, "utf8").trim();
+      } catch {}
+      if (base) break;
+    }
+  }
+  if (!base) usage(`ui: no base; pass --base REV or write ${wt}.handoff/base`);
+  if (base.startsWith("-")) usage(`ui: bad base ${base}`);
+  const sha = (git(wt, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]) || "").trim();
+  if (!sha) fail(`ui: unknown base ${base}`);
+  const diff = git(wt, ["diff", "--name-only", "-z", "--no-renames", sha, "HEAD"]);
+  const log = git(wt, ["log", "--reverse", "--format=%s", `${sha}..HEAD`]);
+  if (diff === null || log === null) fail(`ui: git diff or log failed in ${wt}`);
+  const paths = diff.split("\0").filter(Boolean).sort().slice(0, MAX_PATHS);
+  const commits = log.split("\n").filter(Boolean).slice(0, MAX_COMMITS);
+  const state = normalize(["paths:", ...paths, "commits:", ...commits].join("\n"));
+  return emit(await runPoint(settings, uiSpec(settings, state), repoName(wt)), opts.json);
+}
+
+function stagesCommand(args) {
+  const { opts, rest } = parseOptions(args, [], ["--json"]);
+  if (rest.length !== 1) usage("stages: give one LEVEL");
+  const settings = loadSettings();
+  const level = findLevel(settings.levels, rest[0]);
+  if (!level) usage(`stages: unknown level "${rest[0]}"; levels: ${settings.levels.map((l) => l.id).join(", ")}`);
+  const stages = stagesOf(level);
+  return { code: 0, out: opts.json ? `${JSON.stringify(stages)}\n` : `${level.id}: ${stagesText(stages)}\n` };
+}
+
+function checkCommand(args) {
+  const { rest } = parseOptions(args, [], []);
+  if (rest.length > 1) usage("check: give at most one FILE");
+  const r = readSettings(rest.length ? path.resolve(rest[0]) : path.join(DIR, "settings.json"));
+  return r.problem ? { code: 2, out: `${r.problem}\n` } : { code: 0, out: "ok\n" };
+}
+
+async function main([cmd, ...args]) {
+  switch (cmd) {
+    case "level":
+    case "recipe":
+    case "start":
+      return taskCommand(cmd, args);
+    case "ui":
+      return uiCommand(args);
+    case "stages":
+      return stagesCommand(args);
+    case "check":
+      return checkCommand(args);
+    case "-h":
+    case "--help":
+      return { code: 0, out: USAGE };
+    case undefined:
+      return usage("no decision point");
+    default:
+      return usage(`unknown decision point "${cmd}"`);
+  }
+}
+
+function finish(code, out, err) {
+  try {
+    if (err) fs.writeSync(2, err);
+    if (out) fs.writeSync(1, out);
+  } catch {}
+  process.exit(code);
+}
+
+main(process.argv.slice(2)).then(
+  (r) => finish(r.code, r.out, r.err),
+  (e) => (e instanceof Exit ? finish(e.code, e.out, e.err) : finish(2, "", `decide: ${(e && e.stack) || e}\n`)),
+);
